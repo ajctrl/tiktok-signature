@@ -86,6 +86,7 @@ configure `ghcr.io` credentials in Portainer under **Registries**.
 | `PROXY_PASS`                     | empty                                    | Proxy password                                      |
 | `MAX_GENERATIONS_BEFORE_REFRESH` | `500`                                    | Signatures generated before browser restart         |
 | `MAX_SESSION_AGE_MS`             | `1800000`                                | Maximum browser session age in milliseconds         |
+| `RESTART_COOLDOWN_MS`            | `60000`                                  | Minimum interval between successful manual restarts |
 
 After deployment, verify the service at
 `http://<docker-host>:<HOST_PORT>/health`. The publish workflow builds both
@@ -176,16 +177,23 @@ curl http://localhost:8080/health
   "generationCount": 150,
   "maxGenerationsBeforeRefresh": 500,
   "queueLength": 0,
+  "isProcessing": false,
+  "restarting": false,
+  "restartCooldownRemainingSeconds": 0,
   "proxyEnabled": false
 }
 ```
 
-### GET /restart
+### GET or POST /restart
 
-Restart the browser session (useful if signatures stop working).
+Restart the browser session (useful if signatures stop working). Concurrent
+requests share one restart. A new request within the configured cooldown gets
+`429 Too Many Requests` with a `Retry-After` header. Signature and fetch
+requests received during a restart wait in the browser-operation queue.
 
 ```bash
 curl http://localhost:8080/restart
+curl -X POST http://localhost:8080/restart
 ```
 
 ## Usage Examples

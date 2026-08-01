@@ -17,6 +17,7 @@
  * - PROXY_HOST    - Proxy host:port (e.g., "proxy.example.com:8080")
  * - PROXY_USER    - Proxy username
  * - PROXY_PASS    - Proxy password
+ * - RESTART_COOLDOWN_MS - Minimum interval between manual restarts (default: 60000)
  */
 
 import http from "http";
@@ -26,6 +27,12 @@ import { fileURLToPath } from "url";
 import puppeteer from "puppeteer-extra";
 import StealthPlugin from "puppeteer-extra-plugin-stealth";
 import { encode as encodeXGnarly } from "./xgnarly.mjs";
+import {
+  BrowserOperationQueue,
+  RestartCoordinator,
+  RestartRateLimitError,
+  SingleFlight,
+} from "./browser-operations.mjs";
 
 // Use stealth plugin with default evasions
 puppeteer.use(StealthPlugin());
@@ -99,6 +106,7 @@ let isReady = false;
 let generationCount = 0;
 let initMethod = null;
 let lastInitTime = null;
+const initFlight = new SingleFlight();
 
 // Cache of page-emitted signed URLs, keyed by pathname.
 const signedUrlCache = new Map();
@@ -109,194 +117,159 @@ const MAX_GENERATIONS_BEFORE_REFRESH =
   Number(process.env.MAX_GENERATIONS_BEFORE_REFRESH) || 500; // Restart browser after this many signatures
 const MAX_SESSION_AGE_MS =
   Number(process.env.MAX_SESSION_AGE_MS) || 30 * 60 * 1000; // Restart browser after 30 minutes
+const RESTART_COOLDOWN_MS =
+  Number(process.env.RESTART_COOLDOWN_MS) || 60 * 1000;
+const RESTART_FAILURE_BACKOFF_MS = 5 * 1000;
+const BROWSER_OPERATION_WAIT_TIMEOUT_MS = 90 * 1000;
 
-// Request queue for sequential processing (prevents concurrent access to browser page)
-const requestQueue = [];
-let isProcessingQueue = false;
+// All operations touching the shared page are processed sequentially.
+const browserOperationQueue = new BrowserOperationQueue({
+  waitTimeoutMs: BROWSER_OPERATION_WAIT_TIMEOUT_MS,
+});
 
-/**
- * Add a signature request to the queue and process sequentially
- */
-function queueSignatureRequest(signFn) {
-  return new Promise((resolve, reject) => {
-    const queuePosition = requestQueue.length + 1;
-    if (queuePosition > 1) {
-      console.log(`[Queue] Request queued at position ${queuePosition}`);
-    }
-    requestQueue.push({ signFn, resolve, reject });
-    processQueue();
-  });
-}
-
-/**
- * Process the queue sequentially
- */
-async function processQueue() {
-  if (isProcessingQueue || requestQueue.length === 0) {
-    return;
+function queueBrowserOperation(label, operation) {
+  const queuePosition =
+    browserOperationQueue.length + (browserOperationQueue.processing ? 1 : 0);
+  if (queuePosition > 0) {
+    console.log(`[Queue] ${label} queued at position ${queuePosition}`);
   }
-
-  isProcessingQueue = true;
-
-  while (requestQueue.length > 0) {
-    const { signFn, resolve, reject } = requestQueue.shift();
-    const remaining = requestQueue.length;
-    if (remaining > 0) {
-      console.log(
-        `[Queue] Processing request, ${remaining} remaining in queue`,
-      );
-    }
-    try {
-      const result = await signFn();
-      resolve(result);
-    } catch (e) {
-      console.error(`[Queue] Request failed: ${e.message}`);
-      reject(e);
-    }
-  }
-
-  isProcessingQueue = false;
+  return browserOperationQueue.enqueue(label, operation);
 }
 
 /**
  * Initialize browser with local SDK injection
  */
 async function initBrowser() {
-  if (isInitializing) {
-    // Wait for initialization to complete
-    while (isInitializing) {
-      await new Promise((r) => setTimeout(r, 100));
-    }
-    return;
-  }
-
   if (isReady && browser && page) {
     return;
   }
 
-  isInitializing = true;
-  console.log("[Server] Initializing browser...");
-
-  try {
-    // Determine Chrome executable path
-    const getChromePath = () => {
-      // Check for Docker/env override first
-      if (process.env.PUPPETEER_EXECUTABLE_PATH) {
-        return process.env.PUPPETEER_EXECUTABLE_PATH;
-      }
-      // macOS
-      if (process.platform === "darwin") {
-        return "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome";
-      }
-      // Linux - try common paths
-      if (process.platform === "linux") {
-        const paths = [
-          "/usr/bin/chromium",
-          "/usr/bin/chromium-browser",
-          "/usr/bin/google-chrome",
-          "/usr/bin/google-chrome-stable",
-        ];
-        for (const p of paths) {
-          try {
-            fs.accessSync(p);
-            return p;
-          } catch {}
+  return initFlight.run(async () => {
+    isInitializing = true;
+    console.log("[Server] Initializing browser...");
+    try {
+      // Determine Chrome executable path
+      const getChromePath = () => {
+        // Check for Docker/env override first
+        if (process.env.PUPPETEER_EXECUTABLE_PATH) {
+          return process.env.PUPPETEER_EXECUTABLE_PATH;
         }
+        // macOS
+        if (process.platform === "darwin") {
+          return "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome";
+        }
+        // Linux - try common paths
+        if (process.platform === "linux") {
+          const paths = [
+            "/usr/bin/chromium",
+            "/usr/bin/chromium-browser",
+            "/usr/bin/google-chrome",
+            "/usr/bin/google-chrome-stable",
+          ];
+          for (const p of paths) {
+            try {
+              fs.accessSync(p);
+              return p;
+            } catch {}
+          }
+        }
+        return undefined; // Let Puppeteer find it
+      };
+
+      // Build browser args
+      const browserArgs = [
+        "--no-sandbox",
+        "--disable-setuid-sandbox",
+        "--disable-dev-shm-usage",
+        "--disable-blink-features=AutomationControlled",
+        "--disable-gpu",
+        "--window-size=1920,1080",
+      ];
+
+      // Add proxy if enabled
+      if (PROXY_ENABLED) {
+        browserArgs.push(`--proxy-server=http://${PROXY_HOST}`);
+        console.log(`[Server] Proxy enabled: ${PROXY_HOST}`);
+      } else {
+        console.log("[Server] Proxy disabled - direct connection");
       }
-      return undefined; // Let Puppeteer find it
-    };
 
-    // Build browser args
-    const browserArgs = [
-      "--no-sandbox",
-      "--disable-setuid-sandbox",
-      "--disable-dev-shm-usage",
-      "--disable-blink-features=AutomationControlled",
-      "--disable-gpu",
-      "--window-size=1920,1080",
-    ];
+      // Ensure user data directory exists
+      if (!fs.existsSync(USER_DATA_DIR)) {
+        fs.mkdirSync(USER_DATA_DIR, { recursive: true });
+      }
 
-    // Add proxy if enabled
-    if (PROXY_ENABLED) {
-      browserArgs.push(`--proxy-server=http://${PROXY_HOST}`);
-      console.log(`[Server] Proxy enabled: ${PROXY_HOST}`);
-    } else {
-      console.log("[Server] Proxy disabled - direct connection");
-    }
+      const initializedBrowser = await puppeteer.launch({
+        headless: "new",
+        executablePath: getChromePath(),
+        args: browserArgs,
+        userDataDir: USER_DATA_DIR,
+        ignoreDefaultArgs: ["--enable-automation"],
+      });
 
-    // Ensure user data directory exists
-    if (!fs.existsSync(USER_DATA_DIR)) {
-      fs.mkdirSync(USER_DATA_DIR, { recursive: true });
-    }
+      browser = initializedBrowser;
+      page = await initializedBrowser.newPage();
 
-    browser = await puppeteer.launch({
-      headless: "new",
-      executablePath: getChromePath(),
-      args: browserArgs,
-      userDataDir: USER_DATA_DIR,
-      ignoreDefaultArgs: ["--enable-automation"],
-    });
+      // Permanent passive listener: every signed request the page emits gets
+      // cached by its pathname. /signature reads this cache and returns the
+      // freshest URL without navigating.
+      page.on("request", (request) => {
+        try {
+          const u = request.url();
+          if (!u.includes("X-Gnarly=")) return;
+          const parsed = new URL(u);
+          signedUrlCache.set(parsed.pathname, {
+            url: u,
+            capturedAt: Date.now(),
+            referer: request.headers().referer || "",
+          });
+        } catch (e) {}
+      });
 
-    page = await browser.newPage();
-
-    // Permanent passive listener: every signed request the page emits gets
-    // cached by its pathname. /signature reads this cache and returns the
-    // freshest URL without navigating.
-    page.on("request", (request) => {
-      try {
-        const u = request.url();
-        if (!u.includes("X-Gnarly=")) return;
-        const parsed = new URL(u);
-        signedUrlCache.set(parsed.pathname, {
-          url: u,
-          capturedAt: Date.now(),
-          referer: request.headers().referer || "",
+      // Authenticate with proxy if enabled
+      if (PROXY_ENABLED && PROXY_USER && PROXY_PASS) {
+        await page.authenticate({
+          username: PROXY_USER,
+          password: PROXY_PASS,
         });
-      } catch (e) {}
-    });
-
-    // Authenticate with proxy if enabled
-    if (PROXY_ENABLED && PROXY_USER && PROXY_PASS) {
-      await page.authenticate({
-        username: PROXY_USER,
-        password: PROXY_PASS,
-      });
-    }
-
-    await page.setUserAgent(DEFAULT_UA);
-    await page.setViewport({ width: 1920, height: 1080 });
-
-    // Apply platform override to match Safari on macOS
-    await page.evaluateOnNewDocument(() => {
-      Object.defineProperty(navigator, "platform", {
-        get: () => "MacIntel",
-        configurable: true,
-      });
-    });
-
-    await page.evaluateOnNewDocument(() => {
-      if (typeof window.process === "undefined") {
-        window.process = {
-          env: { NODE_ENV: "production" },
-          browser: true,
-          version: "",
-          versions: {},
-        };
       }
-    });
 
-    // Initialize with local SDK
-    await initWithLocalSdk();
-    lastInitTime = new Date().toISOString();
-    console.log(`[Server] Browser ready (init method: ${initMethod})`);
-    isReady = true;
-  } catch (e) {
-    console.error("[Server] Init error:", e.message);
-    await closeBrowser();
-    throw e;
-  } finally {
-    isInitializing = false;
-  }
+      await page.setUserAgent(DEFAULT_UA);
+      await page.setViewport({ width: 1920, height: 1080 });
+
+      // Apply platform override to match Safari on macOS
+      await page.evaluateOnNewDocument(() => {
+        Object.defineProperty(navigator, "platform", {
+          get: () => "MacIntel",
+          configurable: true,
+        });
+      });
+
+      await page.evaluateOnNewDocument(() => {
+        if (typeof window.process === "undefined") {
+          window.process = {
+            env: { NODE_ENV: "production" },
+            browser: true,
+            version: "",
+            versions: {},
+          };
+        }
+      });
+
+      // Initialize with local SDK
+      await initWithLocalSdk();
+      lastInitTime = new Date().toISOString();
+      console.log(`[Server] Browser ready (init method: ${initMethod})`);
+      isReady = true;
+    } catch (e) {
+      console.error("[Server] Init error:", e.message);
+      await closeBrowser();
+      e.statusCode = 503;
+      throw e;
+    } finally {
+      isInitializing = false;
+    }
+  });
 }
 
 /**
@@ -477,15 +450,18 @@ async function closeBrowser() {
   generationCount = 0;
   initMethod = null;
   lastInitTime = null;
+  signedUrlCache.clear();
 
-  if (browser) {
+  const browserToClose = browser;
+  browser = null;
+  page = null;
+
+  if (browserToClose) {
     try {
-      await browser.close();
+      await browserToClose.close();
     } catch (e) {
       console.error("[Server] Error closing browser:", e.message);
     }
-    browser = null;
-    page = null;
   }
 
   // Clean up user data directory to prevent disk space accumulation
@@ -500,6 +476,19 @@ async function closeBrowser() {
 
   console.log("[Server] Browser closed, all state reset");
 }
+
+async function restartBrowserInternal() {
+  console.log("[Server] Restarting browser...");
+  await closeBrowser();
+  await initBrowser();
+}
+
+const restartCoordinator = new RestartCoordinator({
+  enqueue: queueBrowserOperation,
+  restart: restartBrowserInternal,
+  cooldownMs: RESTART_COOLDOWN_MS,
+  failureBackoffMs: RESTART_FAILURE_BACKOFF_MS,
+});
 
 /**
  * Check if the browser session should be refreshed based on age or generation count
@@ -530,26 +519,22 @@ function shouldRefreshSession() {
  * Check if the page is still valid and ready
  */
 async function ensurePageReady() {
+  if (shouldRefreshSession()) {
+    console.log("[Server] Proactive session refresh...");
+    await restartBrowserInternal();
+    return true;
+  }
+
   try {
     if (!browser || !page) {
       throw new Error("Browser or page not initialized");
-    }
-
-    // Check if session should be refreshed to avoid blocks
-    if (shouldRefreshSession()) {
-      console.log("[Server] Proactive session refresh...");
-      await closeBrowser();
-      await initBrowser();
-      return true;
     }
 
     await page.mainFrame();
     return true;
   } catch (e) {
     console.log("[Server] Page invalid, reinitializing...", e.message);
-    isReady = false;
-    await closeBrowser();
-    await initBrowser();
+    await restartBrowserInternal();
     return true;
   }
 }
@@ -565,7 +550,7 @@ async function generateSignedUrl(
   userAgent = null,
   navigateTo = null,
 ) {
-  return queueSignatureRequest(() =>
+  return queueBrowserOperation("signature", () =>
     _generateSignedUrlInternal(targetUrl, userAgent, navigateTo),
   );
 }
@@ -612,19 +597,40 @@ async function _generateSignedUrlInternal(
       console.log(
         `[Server] "${msg}" — restarting browser session and retrying...`,
       );
-      try {
-        await closeBrowser();
-      } catch (closeErr) {
-        console.error(
-          "[Server] closeBrowser during recovery failed:",
-          closeErr.message,
-        );
-      }
-      await initBrowser();
+      await restartBrowserInternal();
       return attempt();
     }
     throw e;
   }
+}
+
+async function fetchThroughBrowser(targetUrl) {
+  return queueBrowserOperation("fetch", async () => {
+    await initBrowser();
+    await ensurePageReady();
+
+    console.log(
+      "[Server] Fetching through browser:",
+      targetUrl.substring(0, 80) + "...",
+    );
+
+    return page.evaluate(async (url) => {
+      try {
+        const response = await fetch(url, {
+          credentials: "include",
+          headers: { Accept: "application/json" },
+        });
+        const text = await response.text();
+        return {
+          status: response.status,
+          bodyLength: text.length,
+          data: text ? JSON.parse(text) : null,
+        };
+      } catch (e) {
+        return { error: e.message };
+      }
+    }, targetUrl);
+  });
 }
 
 async function _signViaPageIntercept(targetUrl, navigateTo, userAgent = null) {
@@ -950,8 +956,11 @@ async function handleRequest(req, res) {
           generationCount: generationCount,
           maxGenerationsBeforeRefresh: MAX_GENERATIONS_BEFORE_REFRESH,
           maxSessionAgeMinutes: MAX_SESSION_AGE_MS / 60000,
-          queueLength: requestQueue.length,
-          isProcessing: isProcessingQueue,
+          queueLength: browserOperationQueue.length,
+          isProcessing: browserOperationQueue.processing,
+          restarting: restartCoordinator.isRestarting,
+          restartCooldownRemainingSeconds:
+            restartCoordinator.cooldownRemainingSeconds,
           localSdkAvailable: !!localSdkContent,
           proxyEnabled: PROXY_ENABLED,
           userAgent: currentUserAgent,
@@ -987,30 +996,7 @@ async function handleRequest(req, res) {
         return;
       }
 
-      await initBrowser();
-      await ensurePageReady();
-
-      console.log(
-        "[Server] Fetching through browser:",
-        targetUrl.substring(0, 80) + "...",
-      );
-
-      const fetchResult = await page.evaluate(async (url) => {
-        try {
-          const response = await fetch(url, {
-            credentials: "include",
-            headers: { Accept: "application/json" },
-          });
-          const text = await response.text();
-          return {
-            status: response.status,
-            bodyLength: text.length,
-            data: text ? JSON.parse(text) : null,
-          };
-        } catch (e) {
-          return { error: e.message };
-        }
-      }, targetUrl);
+      const fetchResult = await fetchThroughBrowser(targetUrl);
 
       console.log(
         "[Server] Fetch result:",
@@ -1099,12 +1085,20 @@ async function handleRequest(req, res) {
     }
 
     // Restart browser
-    if (url.pathname === "/restart") {
-      console.log("[Server] Restarting browser...");
-      await closeBrowser();
-      await initBrowser();
+    if (
+      url.pathname === "/restart" &&
+      (req.method === "GET" || req.method === "POST")
+    ) {
+      const restartRequest = restartCoordinator.request();
+      await restartRequest.promise;
       res.writeHead(200);
-      res.end(JSON.stringify({ status: "ok", message: "Browser restarted" }));
+      res.end(
+        JSON.stringify({
+          status: "ok",
+          message: "Browser restarted",
+          coalesced: restartRequest.coalesced,
+        }),
+      );
       return;
     }
 
@@ -1113,7 +1107,20 @@ async function handleRequest(req, res) {
     res.end(JSON.stringify({ error: "Not found" }));
   } catch (e) {
     console.error("[Server] Error:", e.message);
-    res.writeHead(500);
+    const statusCode = e.statusCode || 500;
+    if (e instanceof RestartRateLimitError) {
+      res.setHeader("Retry-After", String(e.retryAfterSeconds));
+      res.writeHead(statusCode);
+      res.end(
+        JSON.stringify({
+          status: "rate_limited",
+          message: e.message,
+          retryAfterSeconds: e.retryAfterSeconds,
+        }),
+      );
+      return;
+    }
+    res.writeHead(statusCode);
     res.end(JSON.stringify({ status: "error", message: e.message }));
   }
 }
@@ -1131,10 +1138,12 @@ server.listen(PORT, () => {
     `  POST /fetch     - Fetch through browser (fallback, 100% reliable)`,
   );
   console.log(`  GET  /health    - Health check`);
-  console.log(`  GET  /restart   - Restart browser session`);
+  console.log(`  GET/POST /restart - Restart browser session`);
 
   // Initialize browser on startup
-  initBrowser().catch((e) => console.error("[Server] Init failed:", e.message));
+  queueBrowserOperation("startup", initBrowser).catch((e) =>
+    console.error("[Server] Init failed:", e.message),
+  );
 });
 
 // Graceful shutdown
