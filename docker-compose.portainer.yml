@@ -1,0 +1,25 @@
+services:
+  tiktok-signature:
+    # Override this in Portainer's stack environment variables when pinning a
+    # release, for example: ghcr.io/ajctrl/tiktok-signature:4.3.6
+    image: ${TIKTOK_SIGNATURE_IMAGE:-ghcr.io/ajctrl/tiktok-signature:latest}
+    ports:
+      - "${HOST_PORT:-8080}:8080"
+    environment:
+      PORT: "8080"
+      PROXY_ENABLED: "${PROXY_ENABLED:-false}"
+      PROXY_HOST: "${PROXY_HOST:-}"
+      PROXY_USER: "${PROXY_USER:-}"
+      PROXY_PASS: "${PROXY_PASS:-}"
+      MAX_GENERATIONS_BEFORE_REFRESH: "${MAX_GENERATIONS_BEFORE_REFRESH:-500}"
+      MAX_SESSION_AGE_MS: "${MAX_SESSION_AGE_MS:-1800000}"
+    init: true
+    restart: unless-stopped
+    shm_size: "1gb"
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8080/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 60s
+    stop_grace_period: 30s

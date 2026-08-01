@@ -56,6 +56,42 @@ docker compose logs -f
 docker compose down
 ```
 
+### Deploying with Portainer
+
+The repository includes a Portainer-ready stack file that uses the prebuilt
+image published to GitHub Container Registry. It does not require Portainer to
+build the source code.
+
+Before the first deployment, push the repository to GitHub and let the
+**Docker Publish** workflow finish. It publishes `latest` on pushes to
+`master`; version tags such as `v4.3.6` also publish versioned images. In the
+GitHub package settings, set the container package visibility to **Public**, or
+configure `ghcr.io` credentials in Portainer under **Registries**.
+
+1. In Portainer, open **Stacks** and select **Add stack**.
+2. Choose **Repository** and enter this repository URL, or choose **Web editor**
+   and paste the contents of `docker-compose.portainer.yml`.
+3. When using **Repository**, set **Compose path** to
+   `docker-compose.portainer.yml`.
+4. Add any optional stack environment variables shown below, then select
+   **Deploy the stack**.
+
+| Variable                         | Default                                  | Description                                         |
+| -------------------------------- | ---------------------------------------- | --------------------------------------------------- |
+| `HOST_PORT`                      | `8080`                                   | Port exposed on the Docker host                     |
+| `TIKTOK_SIGNATURE_IMAGE`         | `ghcr.io/ajctrl/tiktok-signature:latest` | Image to deploy; use a version tag to pin a release |
+| `PROXY_ENABLED`                  | `false`                                  | Enable the outbound proxy                           |
+| `PROXY_HOST`                     | empty                                    | Proxy address in `host:port` format                 |
+| `PROXY_USER`                     | empty                                    | Proxy username                                      |
+| `PROXY_PASS`                     | empty                                    | Proxy password                                      |
+| `MAX_GENERATIONS_BEFORE_REFRESH` | `500`                                    | Signatures generated before browser restart         |
+| `MAX_SESSION_AGE_MS`             | `1800000`                                | Maximum browser session age in milliseconds         |
+
+After deployment, verify the service at
+`http://<docker-host>:<HOST_PORT>/health`. The publish workflow builds both
+`linux/amd64` and `linux/arm64` images. You can also run it manually from the
+GitHub Actions page.
+
 ## API Endpoints
 
 ### POST /signature (Recommended)
