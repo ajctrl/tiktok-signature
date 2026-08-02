@@ -173,6 +173,7 @@ curl http://localhost:8080/health
   "status": "ok",
   "ready": true,
   "initMethod": "local-sdk",
+  "lastSignatureVerificationTime": "2026-08-02T12:00:00.000Z",
   "sessionAgeMinutes": 5,
   "generationCount": 150,
   "maxGenerationsBeforeRefresh": 500,
@@ -189,7 +190,11 @@ curl http://localhost:8080/health
 Restart the browser session (useful if signatures stop working). Concurrent
 requests share one restart. A new request within the configured cooldown gets
 `429 Too Many Requests` with a `Retry-After` header. Signature and fetch
-requests received during a restart wait in the browser-operation queue.
+requests received during a restart wait in the browser-operation queue. Browser
+initialization is attempted at most twice, with a fresh browser profile on the
+second attempt. A restart reports success only after a test URL produces both
+X-Bogus and X-Gnarly; if both attempts fail, it returns `503 Service
+Unavailable` and stays idle until another real request or manual restart.
 
 ```bash
 curl http://localhost:8080/restart

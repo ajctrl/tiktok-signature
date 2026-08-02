@@ -106,7 +106,11 @@ let isReady = false;
 let generationCount = 0;
 let initMethod = null;
 let lastInitTime = null;
+let lastSignatureVerificationTime = null;
 const initFlight = new SingleFlight();
+
+const SIGNATURE_SMOKE_TEST_URL =
+  "https://www.tiktok.com/api/recommend/item_list/?aid=1988&count=1";
 
 // Cache of page-emitted signed URLs, keyed by pathname.
 const signedUrlCache = new Map();
@@ -121,6 +125,8 @@ const RESTART_COOLDOWN_MS =
   Number(process.env.RESTART_COOLDOWN_MS) || 60 * 1000;
 const RESTART_FAILURE_BACKOFF_MS = 5 * 1000;
 const BROWSER_OPERATION_WAIT_TIMEOUT_MS = 90 * 1000;
+const BROWSER_INIT_MAX_ATTEMPTS = 2;
+const BROWSER_INIT_RETRY_DELAY_MS = 1_000;
 
 // All operations touching the shared page are processed sequentially.
 const browserOperationQueue = new BrowserOperationQueue({
@@ -146,130 +152,161 @@ async function initBrowser() {
 
   return initFlight.run(async () => {
     isInitializing = true;
-    console.log("[Server] Initializing browser...");
+    let lastError = null;
+
     try {
-      // Determine Chrome executable path
-      const getChromePath = () => {
-        // Check for Docker/env override first
-        if (process.env.PUPPETEER_EXECUTABLE_PATH) {
-          return process.env.PUPPETEER_EXECUTABLE_PATH;
-        }
-        // macOS
-        if (process.platform === "darwin") {
-          return "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome";
-        }
-        // Linux - try common paths
-        if (process.platform === "linux") {
-          const paths = [
-            "/usr/bin/chromium",
-            "/usr/bin/chromium-browser",
-            "/usr/bin/google-chrome",
-            "/usr/bin/google-chrome-stable",
-          ];
-          for (const p of paths) {
-            try {
-              fs.accessSync(p);
-              return p;
-            } catch {}
+      for (let attempt = 1; attempt <= BROWSER_INIT_MAX_ATTEMPTS; attempt++) {
+        console.log(
+          `[Server] Initializing browser (attempt ${attempt}/${BROWSER_INIT_MAX_ATTEMPTS})...`,
+        );
+
+        try {
+          await initializeBrowserOnce();
+          return;
+        } catch (e) {
+          lastError = e;
+          console.error(
+            `[Server] Init attempt ${attempt}/${BROWSER_INIT_MAX_ATTEMPTS} failed:`,
+            e.message,
+          );
+          await closeBrowser();
+
+          if (attempt < BROWSER_INIT_MAX_ATTEMPTS) {
+            console.log(
+              `[Server] Retrying browser initialization in ${BROWSER_INIT_RETRY_DELAY_MS}ms...`,
+            );
+            await new Promise((resolve) =>
+              setTimeout(resolve, BROWSER_INIT_RETRY_DELAY_MS),
+            );
           }
         }
-        return undefined; // Let Puppeteer find it
-      };
-
-      // Build browser args
-      const browserArgs = [
-        "--no-sandbox",
-        "--disable-setuid-sandbox",
-        "--disable-dev-shm-usage",
-        "--disable-blink-features=AutomationControlled",
-        "--disable-gpu",
-        "--window-size=1920,1080",
-      ];
-
-      // Add proxy if enabled
-      if (PROXY_ENABLED) {
-        browserArgs.push(`--proxy-server=http://${PROXY_HOST}`);
-        console.log(`[Server] Proxy enabled: ${PROXY_HOST}`);
-      } else {
-        console.log("[Server] Proxy disabled - direct connection");
       }
 
-      // Ensure user data directory exists
-      if (!fs.existsSync(USER_DATA_DIR)) {
-        fs.mkdirSync(USER_DATA_DIR, { recursive: true });
-      }
-
-      const initializedBrowser = await puppeteer.launch({
-        headless: "new",
-        executablePath: getChromePath(),
-        args: browserArgs,
-        userDataDir: USER_DATA_DIR,
-        ignoreDefaultArgs: ["--enable-automation"],
-      });
-
-      browser = initializedBrowser;
-      page = await initializedBrowser.newPage();
-
-      // Permanent passive listener: every signed request the page emits gets
-      // cached by its pathname. /signature reads this cache and returns the
-      // freshest URL without navigating.
-      page.on("request", (request) => {
-        try {
-          const u = request.url();
-          if (!u.includes("X-Gnarly=")) return;
-          const parsed = new URL(u);
-          signedUrlCache.set(parsed.pathname, {
-            url: u,
-            capturedAt: Date.now(),
-            referer: request.headers().referer || "",
-          });
-        } catch (e) {}
-      });
-
-      // Authenticate with proxy if enabled
-      if (PROXY_ENABLED && PROXY_USER && PROXY_PASS) {
-        await page.authenticate({
-          username: PROXY_USER,
-          password: PROXY_PASS,
-        });
-      }
-
-      await page.setUserAgent(DEFAULT_UA);
-      await page.setViewport({ width: 1920, height: 1080 });
-
-      // Apply platform override to match Safari on macOS
-      await page.evaluateOnNewDocument(() => {
-        Object.defineProperty(navigator, "platform", {
-          get: () => "MacIntel",
-          configurable: true,
-        });
-      });
-
-      await page.evaluateOnNewDocument(() => {
-        if (typeof window.process === "undefined") {
-          window.process = {
-            env: { NODE_ENV: "production" },
-            browser: true,
-            version: "",
-            versions: {},
-          };
-        }
-      });
-
-      // Initialize with local SDK
-      await initWithLocalSdk();
-      lastInitTime = new Date().toISOString();
-      console.log(`[Server] Browser ready (init method: ${initMethod})`);
-      isReady = true;
-    } catch (e) {
-      console.error("[Server] Init error:", e.message);
-      await closeBrowser();
-      e.statusCode = 503;
-      throw e;
+      lastError.statusCode = 503;
+      throw lastError;
     } finally {
       isInitializing = false;
     }
   });
+}
+
+async function initializeBrowserOnce() {
+  // Determine Chrome executable path
+  const getChromePath = () => {
+    // Check for Docker/env override first
+    if (process.env.PUPPETEER_EXECUTABLE_PATH) {
+      return process.env.PUPPETEER_EXECUTABLE_PATH;
+    }
+    // macOS
+    if (process.platform === "darwin") {
+      return "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome";
+    }
+    // Linux - try common paths
+    if (process.platform === "linux") {
+      const paths = [
+        "/usr/bin/chromium",
+        "/usr/bin/chromium-browser",
+        "/usr/bin/google-chrome",
+        "/usr/bin/google-chrome-stable",
+      ];
+      for (const p of paths) {
+        try {
+          fs.accessSync(p);
+          return p;
+        } catch {}
+      }
+    }
+    return undefined; // Let Puppeteer find it
+  };
+
+  // Build browser args
+  const browserArgs = [
+    "--no-sandbox",
+    "--disable-setuid-sandbox",
+    "--disable-dev-shm-usage",
+    "--disable-blink-features=AutomationControlled",
+    "--disable-gpu",
+    "--window-size=1920,1080",
+  ];
+
+  // Add proxy if enabled
+  if (PROXY_ENABLED) {
+    browserArgs.push(`--proxy-server=http://${PROXY_HOST}`);
+    console.log(`[Server] Proxy enabled: ${PROXY_HOST}`);
+  } else {
+    console.log("[Server] Proxy disabled - direct connection");
+  }
+
+  // Ensure user data directory exists
+  if (!fs.existsSync(USER_DATA_DIR)) {
+    fs.mkdirSync(USER_DATA_DIR, { recursive: true });
+  }
+
+  const initializedBrowser = await puppeteer.launch({
+    headless: "new",
+    executablePath: getChromePath(),
+    args: browserArgs,
+    userDataDir: USER_DATA_DIR,
+    ignoreDefaultArgs: ["--enable-automation"],
+  });
+
+  browser = initializedBrowser;
+  page = await initializedBrowser.newPage();
+
+  // Permanent passive listener: every signed request the page emits gets
+  // cached by its pathname. /signature reads this cache and returns the
+  // freshest URL without navigating.
+  page.on("request", (request) => {
+    try {
+      const u = request.url();
+      if (!u.includes("X-Gnarly=")) return;
+      const parsed = new URL(u);
+      signedUrlCache.set(parsed.pathname, {
+        url: u,
+        capturedAt: Date.now(),
+        referer: request.headers().referer || "",
+      });
+    } catch (e) {}
+  });
+
+  // Authenticate with proxy if enabled
+  if (PROXY_ENABLED && PROXY_USER && PROXY_PASS) {
+    await page.authenticate({
+      username: PROXY_USER,
+      password: PROXY_PASS,
+    });
+  }
+
+  await page.setUserAgent(DEFAULT_UA);
+  await page.setViewport({ width: 1920, height: 1080 });
+
+  // Apply platform override to match Safari on macOS
+  await page.evaluateOnNewDocument(() => {
+    Object.defineProperty(navigator, "platform", {
+      get: () => "MacIntel",
+      configurable: true,
+    });
+  });
+
+  await page.evaluateOnNewDocument(() => {
+    if (typeof window.process === "undefined") {
+      window.process = {
+        env: { NODE_ENV: "production" },
+        browser: true,
+        version: "",
+        versions: {},
+      };
+    }
+  });
+
+  // Initialize with local SDK
+  await initWithLocalSdk();
+  await verifySignatureGeneration();
+  lastInitTime = new Date().toISOString();
+  isReady = true;
+  console.log(
+    `[Server] Browser ready; signature verified (init method: ${initMethod})`,
+  );
 }
 
 /**
@@ -444,12 +481,29 @@ async function initWithLocalSdk() {
   console.log(`[Server] Captured ${cookies.length} cookies`);
 }
 
+/**
+ * Generate a real pair of signatures before declaring the browser ready.
+ * This catches sessions where the page loaded but the SDK cannot actually sign.
+ */
+async function verifySignatureGeneration() {
+  console.log("[Server] Verifying signature generation...");
+  const result = await _signDirectly(SIGNATURE_SMOKE_TEST_URL, null, false);
+
+  if (!result.xBogus || !result.xGnarly) {
+    throw new Error("Signature verification returned an empty signature");
+  }
+
+  lastSignatureVerificationTime = new Date().toISOString();
+  console.log("[Server] Signature generation verified successfully");
+}
+
 async function closeBrowser() {
   isReady = false;
   cookies = null;
   generationCount = 0;
   initMethod = null;
   lastInitTime = null;
+  lastSignatureVerificationTime = null;
   signedUrlCache.clear();
 
   const browserToClose = browser;
@@ -665,7 +719,11 @@ async function _signViaPageIntercept(targetUrl, navigateTo, userAgent = null) {
   );
 }
 
-async function _signDirectly(fetchUrl, userAgent = null) {
+async function _signDirectly(
+  fetchUrl,
+  userAgent = null,
+  countGeneration = true,
+) {
   const out = await page.evaluate((url) => {
     if (typeof window.__sdkN === "undefined") {
       return { error: "SDK not initialized" };
@@ -757,7 +815,7 @@ async function _signDirectly(fetchUrl, userAgent = null) {
   u.searchParams.set("X-Gnarly", xg);
 
   cookies = await page.cookies();
-  generationCount++;
+  if (countGeneration) generationCount++;
   return parseResult(u.toString(), userAgent);
 }
 
@@ -952,6 +1010,7 @@ async function handleRequest(req, res) {
           initializing: isInitializing,
           initMethod: initMethod,
           lastInitTime: lastInitTime,
+          lastSignatureVerificationTime: lastSignatureVerificationTime,
           sessionAgeMinutes: Math.round(sessionAge / 60000),
           generationCount: generationCount,
           maxGenerationsBeforeRefresh: MAX_GENERATIONS_BEFORE_REFRESH,
@@ -1095,7 +1154,9 @@ async function handleRequest(req, res) {
       res.end(
         JSON.stringify({
           status: "ok",
-          message: "Browser restarted",
+          message: "Browser restarted and signature generation verified",
+          ready: isReady,
+          signatureVerifiedAt: lastSignatureVerificationTime,
           coalesced: restartRequest.coalesced,
         }),
       );
