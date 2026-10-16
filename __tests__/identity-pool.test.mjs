@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import fs from "node:fs";
 import vm from "node:vm";
+import { encode as encodeXGnarly } from "../xgnarly.mjs";
 
 const serverUrl = new URL("../server.mjs", import.meta.url);
 
@@ -20,6 +21,8 @@ async function harness({ poolSize = 2, failedSignatures = 0, env = {} } = {}) {
     beforeNavigate: null,
     beforeFetch: null,
     tokens: {},
+    bogusCalls: [],
+    gnarlyCalls: [],
     now: Date.now(),
   };
   let handler;
@@ -48,7 +51,16 @@ async function harness({ poolSize = 2, failedSignatures = 0, env = {} } = {}) {
         window: {
           scrollBy() {},
           byted_acrawler: { frontierSign() {} },
-          __sdkN: { u: { 995: { v: () => "verified-bogus" } } },
+          __sdkN: {
+            u: {
+              995: {
+                v: (query, body) => {
+                  controls.bogusCalls.push({ identity, query, body });
+                  return "verified-bogus";
+                },
+              },
+            },
+          },
         },
         fetch: async () => {
           await controls.beforeFetch?.(identity);
@@ -79,9 +91,9 @@ async function harness({ poolSize = 2, failedSignatures = 0, env = {} } = {}) {
             },
           ];
         },
-        async evaluate(fn, arg) {
+        async evaluate(fn, ...args) {
           if (String(fn).includes("window.__sdkN")) {
-            await controls.beforeSign?.(arg, identity);
+            await controls.beforeSign?.(args[0], identity);
             if (controls.failedSignatures > 0) {
               controls.failedSignatures--;
               return { error: "SDK not ready" };
@@ -92,9 +104,9 @@ async function harness({ poolSize = 2, failedSignatures = 0, env = {} } = {}) {
             false,
             "operation used a retired context",
           );
-          browserGlobals.argument = arg;
+          browserGlobals.arguments = args;
           return vm.runInContext(
-            `(${fn.toString()})(argument)`,
+            `(${fn.toString()})(...arguments)`,
             browserGlobals,
           );
         },
@@ -142,13 +154,21 @@ async function harness({ poolSize = 2, failedSignatures = 0, env = {} } = {}) {
     },
   });
   await module.link(async (specifier) => {
-    const imported = Object.hasOwn(mocks, specifier)
-      ? { default: mocks[specifier] }
-      : await import(
-          specifier.startsWith(".")
-            ? new URL(specifier, serverUrl).href
-            : specifier
-        );
+    const imported =
+      specifier === "./xgnarly.mjs"
+        ? {
+            encode: (...args) => {
+              controls.gnarlyCalls.push({ query: args[0], body: args[1] });
+              return encodeXGnarly(...args);
+            },
+          }
+        : Object.hasOwn(mocks, specifier)
+          ? { default: mocks[specifier] }
+          : await import(
+              specifier.startsWith(".")
+                ? new URL(specifier, serverUrl).href
+                : specifier
+            );
     return new vm.SyntheticModule(
       Object.keys(imported),
       function () {
@@ -672,6 +692,116 @@ test("a failed reserved signature retries on another identity and releases its r
   );
   assert.equal(next.status, 200);
   assert.equal(next.body.data.identity, 2);
+});
+
+test("POST signing passes exact body bytes to both signers without charging smoke verification", async () => {
+  const h = await harness({ poolSize: 1 });
+  const body = ' { "text": "日本語 🍵", "value": 1 }\n';
+  const result = await h.request("/signature", {
+    url: "https://www.tiktok.com/api/example/?count=1",
+    body,
+  });
+  assert.equal(result.status, 200);
+  assert.deepEqual(
+    h.controls.bogusCalls.map((call) => call.body),
+    ["", body],
+  );
+  assert.deepEqual(
+    h.controls.gnarlyCalls.map((call) => call.body),
+    ["", body],
+  );
+  assert.equal(h.controls.bogusCalls[1].query, h.controls.gnarlyCalls[1].query);
+  assert.equal((await h.request("/health")).body.generationCount, 1);
+});
+
+test("POST signing serializes JSON values and preserves empty-body GET behavior", async () => {
+  const h = await harness({ poolSize: 1 });
+  for (const [body, expected] of [
+    [{ value: "日本語", count: 2 }, '{"value":"日本語","count":2}'],
+    [[1, "two"], '[1,"two"]'],
+    [0, "0"],
+    [false, "false"],
+    ["", ""],
+    [null, ""],
+    [undefined, ""],
+  ]) {
+    const result = await h.request("/signature", {
+      url: "https://www.tiktok.com/api/example/",
+      body,
+    });
+    assert.equal(result.status, 200);
+    assert.equal(h.controls.bogusCalls.at(-1).body, expected);
+    assert.equal(h.controls.gnarlyCalls.at(-1).body, expected);
+  }
+});
+
+test("body with navigateTo is rejected before any browser work", async () => {
+  const h = await harness();
+  h.controls.beforeNavigate = () => {
+    throw new Error("Unexpected browser navigation for an invalid request");
+  };
+  for (const body of ['{"value":1}', { value: 1 }, false, 0]) {
+    const result = await h.request("/signature", {
+      url: "https://www.tiktok.com/api/example/",
+      navigateTo: "https://www.tiktok.com/@example",
+      body,
+    });
+    assert.equal(result.status, 400);
+    assert.match(result.body.message, /body.*navigateTo/);
+    assert.equal(h.contexts.length, 0);
+  }
+  const missingUrl = await h.request("/signature", {
+    navigateTo: "page",
+    body: "x",
+  });
+  assert.equal(missingUrl.status, 400);
+  assert.match(missingUrl.body.message, /URL is required/);
+});
+
+test("POST signing preserves the body when retrying on a replacement identity", async () => {
+  const h = await harness({ poolSize: 1 });
+  await h.request("/signature", { url: "https://www.tiktok.com/api/example/" });
+  h.controls.failedSignatures = 1;
+  const body = "value=one%20two&count=2";
+  const result = await withDeadline(
+    h.request("/signature", {
+      url: "https://www.tiktok.com/api/example/",
+      body,
+    }),
+  );
+  assert.equal(result.status, 200);
+  assert.equal(result.body.data.identity, 2);
+  assert.equal(h.controls.bogusCalls.at(-1).identity, 2);
+  assert.equal(h.controls.bogusCalls.at(-1).body, body);
+  assert.equal(h.controls.gnarlyCalls.at(-1).body, body);
+  assert.equal((await h.request("/health")).body.generationCount, 1);
+});
+
+test("queued POST signatures keep their own request bodies", async () => {
+  const h = await harness({ poolSize: 1 });
+  await h.request("/signature", { url: "https://www.tiktok.com/api/example/" });
+  h.controls.bogusCalls.length = 0;
+  h.controls.gnarlyCalls.length = 0;
+  const bodies = ['{"value":1}', '{ "value": 2 }\n', "value=three"];
+  const results = await withDeadline(
+    Promise.all(
+      bodies.map((body) =>
+        h.request("/signature", {
+          url: "https://www.tiktok.com/api/example/",
+          body,
+        }),
+      ),
+    ),
+  );
+  assert.ok(results.every((result) => result.status === 200));
+  assert.deepEqual(
+    h.controls.bogusCalls.map((call) => call.body),
+    bodies,
+  );
+  assert.deepEqual(
+    h.controls.gnarlyCalls.map((call) => call.body),
+    bodies,
+  );
 });
 
 async function withDeadline(promise) {

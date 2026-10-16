@@ -134,6 +134,32 @@ curl -X POST http://localhost:8080/signature \
 
 > **Important:** When making requests to TikTok, you must use the `user_agent` from the response. The signature is tied to the browser environment, so a mismatched User-Agent will cause failures.
 
+**Signing a POST request body:** pass an optional `body` to `/signature` so both
+X-Bogus and X-Gnarly cover the request payload. Prefer a string and send that
+**exact same string** to TikTok, including whitespace, escaping, and field order.
+For example, the signing request can be:
+
+```json
+{
+  "url": "https://www.tiktok.com/api/your-post-endpoint/",
+  "body": "{\"value\":1}"
+}
+```
+
+Then POST `{"value":1}` to the returned `signed_url`, using the returned cookies
+and user agent, plus the content type required by that endpoint. `/signature`
+only generates the signature; it does not send the POST request. `/fetch` still
+performs GET requests.
+
+Non-string JSON values are converted with `JSON.stringify`; passing a string
+avoids differences between serializers. An omitted, `null`, or empty `body`
+preserves the existing empty-body signing behavior. A non-empty body cannot be
+combined with `navigateTo`: that combination returns HTTP **400** before browser
+work, because the page-intercept path captures TikTok's own request signature.
+
+Adapted from [upstream PR #262](https://github.com/carcabot/tiktok-signature/pull/262)
+for this fork's identity pool and signature verification.
+
 ### POST /fetch (Fallback)
 
 Fetch data directly through the browser. This endpoint makes the actual API request through the browser session, bypassing TikTok's bot detection entirely.

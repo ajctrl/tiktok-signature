@@ -907,30 +907,49 @@ function extractCookieValue(cookieHeader, name) {
 // Signing
 // ---------------------------------------------------------------------------
 
+function validateSigningBody(navigateTo, requestBody) {
+  if (navigateTo && requestBody) {
+    const error = new Error(
+      '"body" cannot be combined with "navigateTo": page-intercept signatures cannot cover a caller-supplied body. Omit "navigateTo" to sign a body.',
+    );
+    error.statusCode = 400;
+    throw error;
+  }
+}
+
 /**
  * Generate signed URL for any TikTok URL
  * Triggers fetch, SDK signs it, we capture and abort
  * @param {string} targetUrl - The URL to sign
  * @param {string|null} userAgent - Optional custom user agent to return in response
+ * @param {string|null} navigateTo - Page-intercept URL; cannot be combined with a non-empty body
+ * @param {string} requestBody - Exact request body to sign; defaults to empty for GET
  */
 async function generateSignedUrl(
   targetUrl,
   userAgent = null,
   navigateTo = null,
+  requestBody = "",
 ) {
   return queueSignatureRequest(() =>
-    _generateSignedUrlInternal(targetUrl, userAgent, navigateTo),
+    _generateSignedUrlInternal(targetUrl, userAgent, navigateTo, requestBody),
   );
 }
 
 /**
  * Internal implementation - must be called through queue
+ * @param {string} targetUrl - URL to sign
+ * @param {string|null} userAgent - Optional user agent to return
+ * @param {string|null} navigateTo - Page-intercept URL; mutually exclusive with a non-empty body
+ * @param {string} requestBody - Exact request body; mutually exclusive with navigateTo
  */
 async function _generateSignedUrlInternal(
   targetUrl,
   userAgent = null,
   navigateTo = null,
+  requestBody = "",
 ) {
+  validateSigningBody(navigateTo, requestBody);
   // Parse target URL - remove existing signatures and normalize fingerprint params
   const urlObj = new URL(targetUrl);
   urlObj.searchParams.delete("X-Bogus");
@@ -947,7 +966,7 @@ async function _generateSignedUrlInternal(
     console.log(
       `[Server] Signing URL (identity ${idn.id}): ${fetchUrl.substring(0, 100)}...`,
     );
-    return _signDirectly(idn, fetchUrl, userAgent);
+    return _signDirectly(idn, fetchUrl, userAgent, true, requestBody);
   };
 
   const { identity: idn, result } = await scheduleIdentityOperation(attempt);
@@ -1016,93 +1035,107 @@ async function _signDirectly(
   fetchUrl,
   userAgent = null,
   countGeneration = true,
+  requestBody = "",
 ) {
   const page = idn.page;
-  const out = await page.evaluate((url) => {
-    if (typeof window.__sdkN === "undefined") {
-      return { error: "SDK not initialized" };
-    }
-    const sdkN = window.__sdkN;
-    let table = null;
-    if (sdkN.u && sdkN.u[995] && sdkN.u[995].v) table = sdkN.u;
-    else if (sdkN.B && sdkN.B.o && sdkN.B.o[995] && sdkN.B.o[995].v)
-      table = sdkN.B.o;
-    else if (sdkN.o && sdkN.o[995] && sdkN.o[995].v) table = sdkN.o;
-    if (!table) return { error: "SDK not ready" };
-    const u995 = table[995] && table[995].v;
-    if (typeof u995 !== "function") {
-      return { error: "SDK not ready" };
-    }
-
-    const u = new URL(url);
-    const msTokenMatches = [...document.cookie.matchAll(/msToken=([^;]+)/g)];
-    const msToken = msTokenMatches.length
-      ? msTokenMatches[msTokenMatches.length - 1][1]
-      : "";
-    u.searchParams.delete("X-Bogus");
-    u.searchParams.delete("X-Gnarly");
-    u.searchParams.set("msToken", msToken);
-    const queryString = u.search.slice(1);
-
-    if (typeof window.__sigCallCount !== "number") window.__sigCallCount = 100;
-    window.__sigCallCount += 1;
-    const baseN = window.__sigCallCount;
-    let counterObj = {
-      totalXHRRequests: Math.floor(baseN * 0.6),
-      totalFetchRequests: Math.floor(baseN * 0.4) + 3,
-      interceptedXHRRequests: Math.floor(baseN * 0.1),
-      interceptedFetchRequests: Math.floor(baseN * 0.05) + 1,
-    };
-    try {
-      const cap3 = window.__cap3 || [];
-      const lastNat = [...cap3]
-        .reverse()
-        .find((c) => c.fn === "gnarly_x" && c.args && c.args[3] && c.args[3].v);
-      if (lastNat && lastNat.args[3].v) {
-        const v = lastNat.args[3].v;
-        const fromCap = {
-          totalXHRRequests: (v.totalXHRRequests && v.totalXHRRequests.v) || 0,
-          totalFetchRequests:
-            (v.totalFetchRequests && v.totalFetchRequests.v) || 0,
-          interceptedXHRRequests:
-            (v.interceptedXHRRequests && v.interceptedXHRRequests.v) || 0,
-          interceptedFetchRequests:
-            (v.interceptedFetchRequests && v.interceptedFetchRequests.v) || 0,
-        };
-        if (fromCap.totalXHRRequests + fromCap.totalFetchRequests > 0) {
-          counterObj = fromCap;
-        }
+  const out = await page.evaluate(
+    (url, body) => {
+      if (typeof window.__sdkN === "undefined") {
+        return { error: "SDK not initialized" };
       }
-    } catch (e) {}
+      const sdkN = window.__sdkN;
+      let table = null;
+      if (sdkN.u && sdkN.u[995] && sdkN.u[995].v) table = sdkN.u;
+      else if (sdkN.B && sdkN.B.o && sdkN.B.o[995] && sdkN.B.o[995].v)
+        table = sdkN.B.o;
+      else if (sdkN.o && sdkN.o[995] && sdkN.o[995].v) table = sdkN.o;
+      if (!table) return { error: "SDK not ready" };
+      const u995 = table[995] && table[995].v;
+      if (typeof u995 !== "function") {
+        return { error: "SDK not ready" };
+      }
 
-    const acrawlerInst =
-      window.byted_acrawler && typeof window.byted_acrawler === "object"
-        ? window.byted_acrawler
-        : null;
-    try {
-      const xb = u995.call(acrawlerInst, queryString, "");
-      return {
-        urlBase: u.toString(),
-        queryString,
-        xBogus: xb,
-        msTokenUsed: msToken,
-        userAgent: navigator.userAgent,
-        cookies: document.cookie,
-        counters: counterObj,
+      const u = new URL(url);
+      const msTokenMatches = [...document.cookie.matchAll(/msToken=([^;]+)/g)];
+      const msToken = msTokenMatches.length
+        ? msTokenMatches[msTokenMatches.length - 1][1]
+        : "";
+      u.searchParams.delete("X-Bogus");
+      u.searchParams.delete("X-Gnarly");
+      u.searchParams.set("msToken", msToken);
+      const queryString = u.search.slice(1);
+
+      if (typeof window.__sigCallCount !== "number")
+        window.__sigCallCount = 100;
+      window.__sigCallCount += 1;
+      const baseN = window.__sigCallCount;
+      let counterObj = {
+        totalXHRRequests: Math.floor(baseN * 0.6),
+        totalFetchRequests: Math.floor(baseN * 0.4) + 3,
+        interceptedXHRRequests: Math.floor(baseN * 0.1),
+        interceptedFetchRequests: Math.floor(baseN * 0.05) + 1,
       };
-    } catch (e) {
-      return { error: e.message, stack: e.stack };
-    }
-  }, fetchUrl);
+      try {
+        const cap3 = window.__cap3 || [];
+        const lastNat = [...cap3]
+          .reverse()
+          .find(
+            (c) => c.fn === "gnarly_x" && c.args && c.args[3] && c.args[3].v,
+          );
+        if (lastNat && lastNat.args[3].v) {
+          const v = lastNat.args[3].v;
+          const fromCap = {
+            totalXHRRequests: (v.totalXHRRequests && v.totalXHRRequests.v) || 0,
+            totalFetchRequests:
+              (v.totalFetchRequests && v.totalFetchRequests.v) || 0,
+            interceptedXHRRequests:
+              (v.interceptedXHRRequests && v.interceptedXHRRequests.v) || 0,
+            interceptedFetchRequests:
+              (v.interceptedFetchRequests && v.interceptedFetchRequests.v) || 0,
+          };
+          if (fromCap.totalXHRRequests + fromCap.totalFetchRequests > 0) {
+            counterObj = fromCap;
+          }
+        }
+      } catch (e) {}
+
+      const acrawlerInst =
+        window.byted_acrawler && typeof window.byted_acrawler === "object"
+          ? window.byted_acrawler
+          : null;
+      try {
+        const xb = u995.call(acrawlerInst, queryString, body);
+        return {
+          urlBase: u.toString(),
+          queryString,
+          xBogus: xb,
+          msTokenUsed: msToken,
+          userAgent: navigator.userAgent,
+          cookies: document.cookie,
+          counters: counterObj,
+        };
+      } catch (e) {
+        return { error: e.message, stack: e.stack };
+      }
+    },
+    fetchUrl,
+    requestBody,
+  );
 
   if (out.error) {
     throw new Error("Sign failed: " + out.error);
   }
 
-  const xg = encodeXGnarly(out.queryString, "", out.userAgent, out.counters, {
-    ubcode: 4,
-    sdkVersion: "1.0.0.368",
-  });
+  const xg = encodeXGnarly(
+    out.queryString,
+    requestBody,
+    out.userAgent,
+    out.counters,
+    {
+      ubcode: 4,
+      sdkVersion: "1.0.0.368",
+    },
+  );
 
   const u = new URL(out.urlBase);
   u.searchParams.set("X-Bogus", out.xBogus);
@@ -1434,6 +1467,7 @@ async function handleRequest(req, res) {
       let targetUrl = null;
       let userAgent = null;
       let navigateTo = null;
+      let requestBody = "";
 
       // Try to parse as JSON first
       try {
@@ -1441,6 +1475,12 @@ async function handleRequest(req, res) {
         if (json.url) targetUrl = json.url;
         if (json.userAgent) userAgent = json.userAgent;
         if (json.navigateTo) navigateTo = json.navigateTo;
+        if (json.body != null) {
+          requestBody =
+            typeof json.body === "string"
+              ? json.body
+              : JSON.stringify(json.body);
+        }
       } catch (e) {
         // Body might be a direct URL string
         try {
@@ -1461,7 +1501,13 @@ async function handleRequest(req, res) {
         return;
       }
 
-      const result = await generateSignedUrl(targetUrl, userAgent, navigateTo);
+      validateSigningBody(navigateTo, requestBody);
+      const result = await generateSignedUrl(
+        targetUrl,
+        userAgent,
+        navigateTo,
+        requestBody,
+      );
 
       res.writeHead(200);
       res.end(
