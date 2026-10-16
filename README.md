@@ -84,9 +84,11 @@ configure `ghcr.io` credentials in Portainer under **Registries**.
 | `PROXY_HOST`                     | empty                                    | Proxy address in `host:port` format                 |
 | `PROXY_USER`                     | empty                                    | Proxy username                                      |
 | `PROXY_PASS`                     | empty                                    | Proxy password                                      |
-| `MAX_GENERATIONS_BEFORE_REFRESH` | `500`                                    | Signatures generated before browser restart         |
-| `MAX_SESSION_AGE_MS`             | `1800000`                                | Maximum browser session age in milliseconds         |
-| `RESTART_COOLDOWN_MS`            | `60000`                                  | Minimum interval between successful manual restarts |
+| `MAX_GENERATIONS_BEFORE_REFRESH` | `500`                                    | Signatures per identity before retirement           |
+| `MAX_SESSION_AGE_MS`             | `1800000`                                | Maximum identity age in milliseconds                |
+| `IDENTITY_POOL_SIZE`             | `3`                                      | Number of browser identities kept warm              |
+| `REPORT_MIN_AGE_MS`              | `15000`                                  | Minimum identity age for report-driven retirement   |
+| `REPORT_RETIRE_COOLDOWN_MS`      | `20000`                                  | Minimum interval between report-driven retirements  |
 
 After deployment, verify the service at
 `http://<docker-host>:<HOST_PORT>/health`. The publish workflow builds both
@@ -138,6 +140,13 @@ Fetch data directly through the browser. This endpoint makes the actual API requ
 
 **Use this only as a fallback** when external requests with signed URLs fail. This endpoint is slower and less scalable because each request goes through the browser.
 
+URLs containing `msToken`, `X-Bogus`, or `X-Gnarly` must carry an `msToken`
+belonging to a current identity. If it is missing, unknown, or has changed after
+cookie rotation or a pool restart, `/fetch` returns HTTP **409** without fetching.
+Request a new signature and retry with the new URL. The token is checked again
+after waiting for earlier operations on that identity. Unsigned URLs without
+`msToken` can use any available identity.
+
 **Request:**
 
 ```bash
@@ -152,11 +161,24 @@ curl -X POST http://localhost:8080/fetch \
 {
   "status": "ok",
   "httpStatus": 200,
+  "contentType": "application/json; charset=utf-8",
   "data": {
     "itemList": [...],
     "cursor": 30,
     "hasMore": true
   }
+}
+```
+
+**Non-JSON responses (HTML pages):** when the target URL returns something that is not JSON (for example a video page such as `https://www.tiktok.com/@user/video/123...`), `data` is `null` and the raw body is returned in `text` instead, so you can extract embedded page data (e.g. `__UNIVERSAL_DATA_FOR_REHYDRATION__`) yourself:
+
+```json
+{
+  "status": "ok",
+  "httpStatus": 200,
+  "contentType": "text/html; charset=utf-8",
+  "data": null,
+  "text": "<!DOCTYPE html>..."
 }
 ```
 
@@ -179,22 +201,48 @@ curl http://localhost:8080/health
   "maxGenerationsBeforeRefresh": 500,
   "queueLength": 0,
   "isProcessing": false,
-  "restarting": false,
-  "restartCooldownRemainingSeconds": 0,
   "proxyEnabled": false
 }
 ```
 
+### POST /report
+
+Tell the server that TikTok answered an **empty body** (HTTP 200, content-length 0) for a
+request built from one of its signatures. The server looks up the identity by the `ttwid` /
+`msToken` in the cookies you send and starts retiring it, minting a replacement
+in the background. Active operations finish before the old context is closed;
+if it is the only identity, it remains available until a replacement is ready.
+
+```bash
+curl -X POST http://localhost:8080/report \
+  -H "Content-Type: application/json" \
+  -d '{"cookies": "<the Cookie header you sent to TikTok>", "reason": "item_list empty body"}'
+```
+
+Response `action` is one of `retired`, `ignored_too_young` (identity younger than
+`REPORT_MIN_AGE_MS`, the empty body was most likely your egress IP), `ignored_cooldown`
+(another retirement happened within `REPORT_RETIRE_COOLDOWN_MS`), `already_retiring` or
+`unknown_identity`.
+
 ### GET or POST /restart
 
-Restart the browser session (useful if signatures stop working). Concurrent
-requests share one restart. A new request within the configured cooldown gets
-`429 Too Many Requests` with a `Retry-After` header. Signature and fetch
-requests received during a restart wait in the browser-operation queue. Browser
-initialization is attempted at most twice, with a fresh browser profile on the
-second attempt. A restart reports success only after a test URL produces both
-X-Bogus and X-Gnarly; if both attempts fail, it returns `503 Service
-Unavailable` and stays idle until another real request or manual restart.
+Retire every identity and warm a fresh pool (useful if signatures stop working).
+Concurrent restart requests share the same pool transition. Existing operations
+finish before their identity is closed; new requests wait for the restart.
+There is no manual restart cooldown.
+
+Each identity must generate both X-Bogus and X-Gnarly before it becomes ready.
+Initialization failures return an error; a later request can try again, following
+the upstream pool lifecycle. This check verifies local signature generation, not
+whether TikTok will accept the signed request.
+
+Signing keeps the upstream signature queue and prefers an idle identity when one
+is available. If all identities are busy, it waits and selects again when an
+identity becomes idle or a new identity is ready. Fetches use an identity-specific
+queue. Retired identities leave selection immediately and close in the background
+after active work finishes,
+so their slow fetches do not delay requests that can use another ready identity.
+If the pool has only one identity, it stays available until a replacement is ready.
 
 ```bash
 curl http://localhost:8080/restart
@@ -416,14 +464,32 @@ See the `examples/` folder for more complete examples (comments, search, trendin
 
 ### Environment Variables
 
-| Variable                    | Default | Description                                          |
-| --------------------------- | ------- | ---------------------------------------------------- |
-| `PORT`                      | `8080`  | Server port                                          |
-| `PROXY_ENABLED`             | `false` | Enable proxy support                                 |
-| `PROXY_HOST`                | -       | Proxy host and port (e.g., `proxy.example.com:8080`) |
-| `PROXY_USER`                | -       | Proxy username                                       |
-| `PROXY_PASS`                | -       | Proxy password                                       |
-| `PUPPETEER_EXECUTABLE_PATH` | auto    | Custom Chrome/Chromium path                          |
+| Variable                         | Default   | Description                                                |
+| -------------------------------- | --------- | ---------------------------------------------------------- |
+| `PORT`                           | `8080`    | Server port                                                |
+| `PROXY_ENABLED`                  | `false`   | Enable proxy support                                       |
+| `PROXY_HOST`                     | -         | Proxy host and port (e.g., `proxy.example.com:8080`)       |
+| `PROXY_USER`                     | -         | Proxy username                                             |
+| `PROXY_PASS`                     | -         | Proxy password                                             |
+| `PUPPETEER_EXECUTABLE_PATH`      | auto      | Custom Chrome/Chromium path                                |
+| `IDENTITY_POOL_SIZE`             | `3`       | Browser identities kept warm; requests rotate through them |
+| `MAX_GENERATIONS_BEFORE_REFRESH` | `500`     | Signatures one identity may emit before it is retired      |
+| `MAX_SESSION_AGE_MS`             | `1800000` | Identity age (ms) before it is retired                     |
+| `REPORT_MIN_AGE_MS`              | `15000`   | `/report` is ignored for identities younger than this (ms) |
+| `REPORT_RETIRE_COOLDOWN_MS`      | `20000`   | Minimum gap (ms) between report-driven retirements         |
+
+### Identity pool
+
+Every signature carries the cookies (`ttwid`, `msToken`, `tt_chain_token`, …) of the
+browser identity that produced it, and TikTok keys its abuse decisions on that identity.
+A single identity signing every request soon gets flagged: `/api/post/item_list/` then
+answers HTTP 200 with an empty body for _any_ egress IP carrying it, while the same URL
+signed by a fresh identity still works. The server therefore keeps `IDENTITY_POOL_SIZE`
+independent identities (one incognito context each), rotates through them per request,
+retires each after `MAX_GENERATIONS_BEFORE_REFRESH` signatures or `MAX_SESSION_AGE_MS`,
+and always mints the replacement **before** closing the old one so the queue never stalls.
+Callers that see an empty body should `POST /report` so the burnt identity is retired
+immediately instead of serving the rest of its budget.
 
 ### Proxy Configuration
 

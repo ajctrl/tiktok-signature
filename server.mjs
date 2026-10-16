@@ -3,21 +3,32 @@
  * TikTok Signature Server
  *
  * Generates valid X-Bogus and X-Gnarly signatures for TikTok API requests.
- * Uses a persistent browser session with local SDK injection for reliable signature generation.
+ * Runs a POOL of independent browser identities (one incognito context each,
+ * with its own ttwid / msToken / tt_chain_token cookie jar) and rotates
+ * through them per request, so no single identity carries the whole signing
+ * volume. Identities are retired after a signature budget or age and replaced
+ * in the background, so the queue never stalls on a browser re-init. Callers
+ * can report an identity that TikTok started answering with empty bodies
+ * (POST /report) and it is retired immediately.
  *
  * Endpoints:
  * - POST /signature - Generate signed URL (body: { "url": "..." }) - RECOMMENDED for scalability
  * - POST /fetch     - Fetch through browser (slower, but 100% reliable fallback)
- * - GET  /health    - Health check
- * - GET  /restart   - Restart browser session
+ * - POST /report    - Report a burnt identity (body: { "cookies": "<Cookie header>" } or { "ttwid": "..." } or { "msToken": "..." })
+ * - GET  /health    - Health check (pool stats)
+ * - GET  /restart   - Retire every identity and warm a fresh pool
  *
  * Environment Variables:
- * - PORT          - Server port (default: 8080)
- * - PROXY_ENABLED - Enable proxy (default: false)
- * - PROXY_HOST    - Proxy host:port (e.g., "proxy.example.com:8080")
- * - PROXY_USER    - Proxy username
- * - PROXY_PASS    - Proxy password
- * - RESTART_COOLDOWN_MS - Minimum interval between manual restarts (default: 60000)
+ * - PORT                           - Server port (default: 8080)
+ * - PROXY_ENABLED                  - Enable proxy (default: false)
+ * - PROXY_HOST                     - Proxy host:port (e.g., "proxy.example.com:8080")
+ * - PROXY_USER                     - Proxy username
+ * - PROXY_PASS                     - Proxy password
+ * - IDENTITY_POOL_SIZE             - Number of concurrent browser identities (default: 3)
+ * - MAX_GENERATIONS_BEFORE_REFRESH - Signatures per identity before it is retired (default: 500)
+ * - MAX_SESSION_AGE_MS             - Identity age before it is retired (default: 30 min)
+ * - REPORT_MIN_AGE_MS              - Ignore /report for identities younger than this (default: 15 s)
+ * - REPORT_RETIRE_COOLDOWN_MS      - Minimum gap between report-driven retirements (default: 20 s)
  */
 
 import http from "http";
@@ -27,12 +38,6 @@ import { fileURLToPath } from "url";
 import puppeteer from "puppeteer-extra";
 import StealthPlugin from "puppeteer-extra-plugin-stealth";
 import { encode as encodeXGnarly } from "./xgnarly.mjs";
-import {
-  BrowserOperationQueue,
-  RestartCoordinator,
-  RestartRateLimitError,
-  SingleFlight,
-} from "./browser-operations.mjs";
 
 // Use stealth plugin with default evasions
 puppeteer.use(StealthPlugin());
@@ -97,224 +102,303 @@ try {
   console.log("[Server] Local SDK not found:", e.message);
 }
 
-// Browser state
-let browser = null;
-let page = null;
-let cookies = null;
-let isInitializing = false;
-let isReady = false;
-let generationCount = 0;
-let initMethod = null;
-let lastInitTime = null;
-let lastSignatureVerificationTime = null;
-const initFlight = new SingleFlight();
+// ---------------------------------------------------------------------------
+// Pool configuration
+// ---------------------------------------------------------------------------
 
+const IDENTITY_POOL_SIZE = Math.max(
+  1,
+  Number(process.env.IDENTITY_POOL_SIZE) || 3,
+);
+// Signatures one identity may emit before it is retired. The identity's
+// ttwid/msToken is what TikTok keys on; at high volume (and from many egress
+// IPs) a single identity is flagged within minutes, after which item_list
+// answers HTTP 200 with an empty body for every request carrying it.
+const MAX_GENERATIONS_BEFORE_REFRESH =
+  Number(process.env.MAX_GENERATIONS_BEFORE_REFRESH) || 500;
+const MAX_SESSION_AGE_MS =
+  Number(process.env.MAX_SESSION_AGE_MS) || 30 * 60 * 1000;
+// A /report against an identity younger than this is ignored: the empty body
+// most likely came from the caller's egress IP, not from the identity.
+const REPORT_MIN_AGE_MS = Number(process.env.REPORT_MIN_AGE_MS) || 15_000;
+// At most one report-driven retirement per this interval, pool-wide. TikTok
+// also judges the caller's egress IP, so a burst of reports during an IP-side
+// block must not churn every identity (each mint costs a page load + ~10 s).
+const REPORT_RETIRE_COOLDOWN_MS =
+  Number(process.env.REPORT_RETIRE_COOLDOWN_MS) || 20_000;
+let lastReportRetireAt = 0;
+
+const SIGNED_CACHE_MAX_AGE_MS = 60_000;
 const SIGNATURE_SMOKE_TEST_URL =
   "https://www.tiktok.com/api/recommend/item_list/?aid=1988&count=1";
 
-// Cache of page-emitted signed URLs, keyed by pathname.
-const signedUrlCache = new Map();
-const SIGNED_CACHE_MAX_AGE_MS = 60_000;
+// ---------------------------------------------------------------------------
+// Browser + identity pool state
+// ---------------------------------------------------------------------------
 
-// Auto-refresh configuration to avoid blocks
-const MAX_GENERATIONS_BEFORE_REFRESH =
-  Number(process.env.MAX_GENERATIONS_BEFORE_REFRESH) || 500; // Restart browser after this many signatures
-const MAX_SESSION_AGE_MS =
-  Number(process.env.MAX_SESSION_AGE_MS) || 30 * 60 * 1000; // Restart browser after 30 minutes
-const RESTART_COOLDOWN_MS =
-  Number(process.env.RESTART_COOLDOWN_MS) || 60 * 1000;
-const RESTART_FAILURE_BACKOFF_MS = 5 * 1000;
-const BROWSER_OPERATION_WAIT_TIMEOUT_MS = 90 * 1000;
-const BROWSER_INIT_MAX_ATTEMPTS = 2;
-const BROWSER_INIT_RETRY_DELAY_MS = 1_000;
+let browser = null;
+let browserLaunch = null; // in-flight launch promise
 
-// All operations touching the shared page are processed sequentially.
-const browserOperationQueue = new BrowserOperationQueue({
-  waitTimeoutMs: BROWSER_OPERATION_WAIT_TIMEOUT_MS,
-});
+let identitySeq = 0;
+/** @type {Identity[]} */
+const identities = [];
+let rrCursor = 0;
+let poolWarming = null; // in-flight warm-up promise (startup / restart)
+let replacementsInFlight = 0;
+let poolRestarting = null;
+const pendingIdentityCreations = new Set();
+const identityWaiters = new Set();
 
-function queueBrowserOperation(label, operation) {
-  const queuePosition =
-    browserOperationQueue.length + (browserOperationQueue.processing ? 1 : 0);
-  if (queuePosition > 0) {
-    console.log(`[Queue] ${label} queued at position ${queuePosition}`);
+function notifyIdentityWaiters() {
+  for (const resolve of identityWaiters) resolve();
+  identityWaiters.clear();
+}
+
+class Identity {
+  constructor() {
+    this.id = ++identitySeq;
+    this.context = null;
+    this.page = null;
+    this.cookies = null;
+    this.cookieIndex = new Set(); // ttwid / msToken values, for /report lookup
+    this.generationCount = 0;
+    this.createdAt = null;
+    this.lastSignatureVerificationTime = null;
+    this.ready = false;
+    this.retired = false;
+    this.retiring = false;
+    this.initMethod = null;
+    this.signedUrlCache = new Map();
+    this.operation = Promise.resolve(); // operations on this identity's page
+    this.pendingOperations = 0;
+    this.closing = null;
   }
-  return browserOperationQueue.enqueue(label, operation);
+
+  get ageMs() {
+    return this.createdAt ? Date.now() - this.createdAt : 0;
+  }
+
+  get ttwid() {
+    const c = (this.cookies || []).find((x) => x.name === "ttwid");
+    return c ? c.value : null;
+  }
+
+  shouldRetire() {
+    if (!this.ready) return false;
+    if (this.generationCount >= MAX_GENERATIONS_BEFORE_REFRESH) return true;
+    if (this.ageMs >= MAX_SESSION_AGE_MS) return true;
+    return false;
+  }
+
+  refreshCookieIndex() {
+    this.cookieIndex = new Set();
+    for (const c of this.cookies || []) {
+      if (c.name === "ttwid" || c.name === "msToken") {
+        this.cookieIndex.add(c.value);
+        try {
+          this.cookieIndex.add(decodeURIComponent(c.value));
+        } catch (e) {}
+      }
+    }
+  }
+
+  async updateCookies() {
+    try {
+      this.cookies = await this.page.cookies();
+      this.refreshCookieIndex();
+    } catch (e) {
+      // Page may be gone; keep the last known cookies.
+    }
+  }
+
+  summary() {
+    return {
+      id: this.id,
+      ready: this.ready,
+      retiring: this.retiring,
+      ageMinutes: Math.round(this.ageMs / 60000),
+      generationCount: this.generationCount,
+      lastSignatureVerificationTime: this.lastSignatureVerificationTime,
+      ttwid: this.ttwid ? this.ttwid.slice(0, 12) + "…" : null,
+    };
+  }
+}
+
+// Request queue for sequential processing (prevents concurrent access to a page)
+const requestQueue = [];
+let isProcessingQueue = false;
+
+/**
+ * Add a signature request to the queue and process sequentially
+ */
+function queueSignatureRequest(signFn) {
+  return new Promise((resolve, reject) => {
+    const queuePosition = requestQueue.length + 1;
+    if (queuePosition > 1) {
+      console.log(`[Queue] Request queued at position ${queuePosition}`);
+    }
+    requestQueue.push({ signFn, resolve, reject });
+    processQueue();
+  });
 }
 
 /**
- * Initialize browser with local SDK injection
+ * Process the queue sequentially
  */
-async function initBrowser() {
-  if (isReady && browser && page) {
+async function processQueue() {
+  if (isProcessingQueue || requestQueue.length === 0) {
     return;
   }
 
-  return initFlight.run(async () => {
-    isInitializing = true;
-    let lastError = null;
+  isProcessingQueue = true;
 
-    try {
-      for (let attempt = 1; attempt <= BROWSER_INIT_MAX_ATTEMPTS; attempt++) {
-        console.log(
-          `[Server] Initializing browser (attempt ${attempt}/${BROWSER_INIT_MAX_ATTEMPTS})...`,
-        );
-
-        try {
-          await initializeBrowserOnce();
-          return;
-        } catch (e) {
-          lastError = e;
-          console.error(
-            `[Server] Init attempt ${attempt}/${BROWSER_INIT_MAX_ATTEMPTS} failed:`,
-            e.message,
-          );
-          await closeBrowser();
-
-          if (attempt < BROWSER_INIT_MAX_ATTEMPTS) {
-            console.log(
-              `[Server] Retrying browser initialization in ${BROWSER_INIT_RETRY_DELAY_MS}ms...`,
-            );
-            await new Promise((resolve) =>
-              setTimeout(resolve, BROWSER_INIT_RETRY_DELAY_MS),
-            );
-          }
-        }
-      }
-
-      lastError.statusCode = 503;
-      throw lastError;
-    } finally {
-      isInitializing = false;
+  while (requestQueue.length > 0) {
+    const { signFn, resolve, reject } = requestQueue.shift();
+    const remaining = requestQueue.length;
+    if (remaining > 0) {
+      console.log(
+        `[Queue] Processing request, ${remaining} remaining in queue`,
+      );
     }
-  });
+    try {
+      const result = await signFn();
+      resolve(result);
+    } catch (e) {
+      console.error(`[Queue] Request failed: ${e.message}`);
+      reject(e);
+    }
+  }
+
+  isProcessingQueue = false;
 }
 
-async function initializeBrowserOnce() {
-  // Determine Chrome executable path
-  const getChromePath = () => {
-    // Check for Docker/env override first
-    if (process.env.PUPPETEER_EXECUTABLE_PATH) {
-      return process.env.PUPPETEER_EXECUTABLE_PATH;
-    }
-    // macOS
-    if (process.platform === "darwin") {
-      return "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome";
-    }
-    // Linux - try common paths
-    if (process.platform === "linux") {
-      const paths = [
-        "/usr/bin/chromium",
-        "/usr/bin/chromium-browser",
-        "/usr/bin/google-chrome",
-        "/usr/bin/google-chrome-stable",
-      ];
-      for (const p of paths) {
-        try {
-          fs.accessSync(p);
-          return p;
-        } catch {}
-      }
-    }
-    return undefined; // Let Puppeteer find it
-  };
+// ---------------------------------------------------------------------------
+// Browser lifecycle (one shared Chromium, one incognito context per identity)
+// ---------------------------------------------------------------------------
 
-  // Build browser args
-  const browserArgs = [
-    "--no-sandbox",
-    "--disable-setuid-sandbox",
-    "--disable-dev-shm-usage",
-    "--disable-blink-features=AutomationControlled",
-    "--disable-gpu",
-    "--window-size=1920,1080",
-  ];
-
-  // Add proxy if enabled
-  if (PROXY_ENABLED) {
-    browserArgs.push(`--proxy-server=http://${PROXY_HOST}`);
-    console.log(`[Server] Proxy enabled: ${PROXY_HOST}`);
-  } else {
-    console.log("[Server] Proxy disabled - direct connection");
+function getChromePath() {
+  // Check for Docker/env override first
+  if (process.env.PUPPETEER_EXECUTABLE_PATH) {
+    return process.env.PUPPETEER_EXECUTABLE_PATH;
   }
-
-  // Ensure user data directory exists
-  if (!fs.existsSync(USER_DATA_DIR)) {
-    fs.mkdirSync(USER_DATA_DIR, { recursive: true });
+  // macOS
+  if (process.platform === "darwin") {
+    return "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome";
   }
-
-  const initializedBrowser = await puppeteer.launch({
-    headless: "new",
-    executablePath: getChromePath(),
-    args: browserArgs,
-    userDataDir: USER_DATA_DIR,
-    ignoreDefaultArgs: ["--enable-automation"],
-  });
-
-  browser = initializedBrowser;
-  page = await initializedBrowser.newPage();
-
-  // Permanent passive listener: every signed request the page emits gets
-  // cached by its pathname. /signature reads this cache and returns the
-  // freshest URL without navigating.
-  page.on("request", (request) => {
-    try {
-      const u = request.url();
-      if (!u.includes("X-Gnarly=")) return;
-      const parsed = new URL(u);
-      signedUrlCache.set(parsed.pathname, {
-        url: u,
-        capturedAt: Date.now(),
-        referer: request.headers().referer || "",
-      });
-    } catch (e) {}
-  });
-
-  // Authenticate with proxy if enabled
-  if (PROXY_ENABLED && PROXY_USER && PROXY_PASS) {
-    await page.authenticate({
-      username: PROXY_USER,
-      password: PROXY_PASS,
-    });
-  }
-
-  await page.setUserAgent(DEFAULT_UA);
-  await page.setViewport({ width: 1920, height: 1080 });
-
-  // Apply platform override to match Safari on macOS
-  await page.evaluateOnNewDocument(() => {
-    Object.defineProperty(navigator, "platform", {
-      get: () => "MacIntel",
-      configurable: true,
-    });
-  });
-
-  await page.evaluateOnNewDocument(() => {
-    if (typeof window.process === "undefined") {
-      window.process = {
-        env: { NODE_ENV: "production" },
-        browser: true,
-        version: "",
-        versions: {},
-      };
+  // Linux - try common paths
+  if (process.platform === "linux") {
+    const paths = [
+      "/usr/bin/chromium",
+      "/usr/bin/chromium-browser",
+      "/usr/bin/google-chrome",
+      "/usr/bin/google-chrome-stable",
+    ];
+    for (const p of paths) {
+      try {
+        fs.accessSync(p);
+        return p;
+      } catch {}
     }
-  });
-
-  // Initialize with local SDK
-  await initWithLocalSdk();
-  await verifySignatureGeneration();
-  lastInitTime = new Date().toISOString();
-  isReady = true;
-  console.log(
-    `[Server] Browser ready; signature verified (init method: ${initMethod})`,
-  );
+  }
+  return undefined; // Let Puppeteer find it
 }
+
+async function ensureBrowser() {
+  if (browser && browser.connected) return browser;
+  if (browserLaunch) return browserLaunch;
+
+  browserLaunch = (async () => {
+    console.log("[Server] Launching browser...");
+
+    const browserArgs = [
+      "--no-sandbox",
+      "--disable-setuid-sandbox",
+      "--disable-dev-shm-usage",
+      "--disable-blink-features=AutomationControlled",
+      "--disable-gpu",
+      "--window-size=1920,1080",
+    ];
+
+    if (PROXY_ENABLED) {
+      browserArgs.push(`--proxy-server=http://${PROXY_HOST}`);
+      console.log(`[Server] Proxy enabled: ${PROXY_HOST}`);
+    } else {
+      console.log("[Server] Proxy disabled - direct connection");
+    }
+
+    if (!fs.existsSync(USER_DATA_DIR)) {
+      fs.mkdirSync(USER_DATA_DIR, { recursive: true });
+    }
+
+    const b = await puppeteer.launch({
+      headless: "new",
+      executablePath: getChromePath(),
+      args: browserArgs,
+      userDataDir: USER_DATA_DIR,
+      ignoreDefaultArgs: ["--enable-automation"],
+    });
+
+    b.on("disconnected", () => {
+      console.error("[Server] Browser disconnected — pool will be rebuilt");
+      browser = null;
+      for (const idn of identities) {
+        idn.ready = false;
+        idn.retired = true;
+      }
+      identities.length = 0;
+      notifyIdentityWaiters();
+    });
+
+    browser = b;
+    return b;
+  })();
+
+  try {
+    return await browserLaunch;
+  } finally {
+    browserLaunch = null;
+  }
+}
+
+async function closeBrowser() {
+  for (const idn of identities) {
+    idn.ready = false;
+    idn.retired = true;
+  }
+  identities.length = 0;
+
+  if (browser) {
+    try {
+      await browser.close();
+    } catch (e) {
+      console.error("[Server] Error closing browser:", e.message);
+    }
+    browser = null;
+  }
+
+  // Clean up user data directory to prevent disk space accumulation
+  try {
+    if (fs.existsSync(USER_DATA_DIR)) {
+      fs.rmSync(USER_DATA_DIR, { recursive: true, force: true });
+      console.log("[Server] Cleaned up browser profile directory");
+    }
+  } catch (e) {
+    console.error("[Server] Error cleaning up profile:", e.message);
+  }
+
+  console.log("[Server] Browser closed, all state reset");
+}
+
+// ---------------------------------------------------------------------------
+// Identity lifecycle
+// ---------------------------------------------------------------------------
 
 /**
  * Detect TikTok's "Something went wrong" interstitial and click its Refresh
  * button. Returns true if the error was detected and handled, false otherwise.
  * Tries up to 2 retries since the second load occasionally errors too.
  */
-async function dismissTikTokErrorIfPresent(maxAttempts = 2) {
+async function dismissTikTokErrorIfPresent(page, maxAttempts = 2) {
   for (let attempt = 1; attempt <= maxAttempts; attempt++) {
     const state = await page.evaluate(() => {
       const text = document.body ? document.body.innerText || "" : "";
@@ -351,17 +435,18 @@ async function dismissTikTokErrorIfPresent(maxAttempts = 2) {
 }
 
 /**
- * Initialize with TikTok page context and LOCAL SDK
- * Injects local SDK BEFORE page loads using evaluateOnNewDocument
+ * Prime one identity's page with TikTok's page context and the LOCAL SDK.
+ * Injects the local SDK BEFORE page loads using evaluateOnNewDocument.
  */
-async function initWithLocalSdk() {
+async function initPageWithLocalSdk(idn) {
+  const page = idn.page;
   if (!localSdkContent) {
     throw new Error(
       "Local SDK not available - ensure webmssdk_5.1.3.js exists in javascript/ folder",
     );
   }
 
-  console.log("[Server] Injecting local SDK before navigation...");
+  console.log(`[Identity ${idn.id}] Injecting local SDK before navigation...`);
 
   // Inject SDK before any page scripts run
   await page.evaluateOnNewDocument((sdkCode) => {
@@ -374,7 +459,6 @@ async function initWithLocalSdk() {
   }, localSdkContent);
 
   // Set up request interception to block TikTok's SDK (prevent conflicts)
-  console.log("[Server] Setting up request interception...");
   await page.setRequestInterception(true);
 
   const requestHandler = async (request) => {
@@ -394,7 +478,9 @@ async function initWithLocalSdk() {
             body,
           });
         } catch (e) {
-          await request.abort();
+          try {
+            await request.abort();
+          } catch (e2) {}
         }
         return;
       }
@@ -406,29 +492,34 @@ async function initWithLocalSdk() {
       url.includes("slardar") ||
       url.includes("acrawler")
     ) {
-      await request.abort();
+      try {
+        await request.abort();
+      } catch (e) {}
       return;
     }
 
     // Block heavy resources to speed up loading
     if (["image", "media", "font"].includes(resourceType)) {
-      await request.abort();
+      try {
+        await request.abort();
+      } catch (e) {}
       return;
     }
 
-    await request.continue();
+    try {
+      await request.continue();
+    } catch (e) {}
   };
 
   page.on("request", requestHandler);
 
-  console.log("[Server] Navigating to TikTok...");
+  console.log(`[Identity ${idn.id}] Navigating to TikTok...`);
   await page.goto("https://www.tiktok.com/@zara", {
     waitUntil: "domcontentloaded",
     timeout: 60000,
   });
 
   // Wait for page to settle and SDK to initialize
-  console.log("[Server] Waiting for SDK...");
   await new Promise((r) => setTimeout(r, 3000));
 
   // Check SDK status
@@ -442,7 +533,7 @@ async function initWithLocalSdk() {
     return { hasAcrawler, hasFrontierSign, keys };
   });
 
-  console.log("[Server] SDK status:", JSON.stringify(sdkStatus));
+  console.log(`[Identity ${idn.id}] SDK status:`, JSON.stringify(sdkStatus));
 
   if (!sdkStatus.hasFrontierSign) {
     throw new Error(
@@ -450,13 +541,9 @@ async function initWithLocalSdk() {
     );
   }
 
-  initMethod = "local-sdk";
-  console.log("[Server] Local SDK initialized successfully");
-
-  // Interception remains active across navigations.
+  idn.initMethod = "local-sdk";
 
   // Warm up the SDK
-  console.log("[Server] Warming up SDK...");
   await page.evaluate(() => window.scrollBy(0, 500));
   await new Promise((r) => setTimeout(r, 2000));
 
@@ -464,134 +551,356 @@ async function initWithLocalSdk() {
   // a blank/white page, sometimes the "Something went wrong" interstitial. The
   // reload primes the second pass with the cookies/msToken accumulated on the
   // first pass, after which the page bundle reliably emits signed requests.
-  console.log("[Server] Reloading page to stabilize session...");
   try {
     await page.reload({ waitUntil: "domcontentloaded", timeout: 60000 });
   } catch (e) {
-    console.log("[Server] Reload warning:", e.message);
+    console.log(`[Identity ${idn.id}] Reload warning:`, e.message);
   }
   await new Promise((r) => setTimeout(r, 3000));
 
   // If the second pass still shows the "Something went wrong" interstitial,
   // click its in-page Refresh button to retry once more.
-  await dismissTikTokErrorIfPresent();
+  await dismissTikTokErrorIfPresent(page);
 
   // Extract cookies for use in requests
-  cookies = await page.cookies();
-  console.log(`[Server] Captured ${cookies.length} cookies`);
+  await idn.updateCookies();
+  console.log(
+    `[Identity ${idn.id}] Captured ${(idn.cookies || []).length} cookies (ttwid ${idn.ttwid ? idn.ttwid.slice(0, 12) + "…" : "none"})`,
+  );
 }
 
 /**
- * Generate a real pair of signatures before declaring the browser ready.
- * This catches sessions where the page loaded but the SDK cannot actually sign.
+ * Create and prime a brand-new identity: its own incognito context (separate
+ * cookie jar → separate ttwid / msToken / tt_chain_token), own page, own SDK.
  */
-async function verifySignatureGeneration() {
-  console.log("[Server] Verifying signature generation...");
-  const result = await _signDirectly(SIGNATURE_SMOKE_TEST_URL, null, false);
+async function createIdentity() {
+  const b = await ensureBrowser();
+  const idn = new Identity();
+  console.log(`[Identity ${idn.id}] Creating...`);
 
-  if (!result.xBogus || !result.xGnarly) {
-    throw new Error("Signature verification returned an empty signature");
+  try {
+    idn.context = await b.createBrowserContext();
+    idn.page = await idn.context.newPage();
+    const page = idn.page;
+
+    // Permanent passive listener: every signed request the page emits gets
+    // cached by its pathname. The page-intercept sign path reads this cache.
+    page.on("request", (request) => {
+      try {
+        const u = request.url();
+        if (!u.includes("X-Gnarly=")) return;
+        const parsed = new URL(u);
+        idn.signedUrlCache.set(parsed.pathname, {
+          url: u,
+          capturedAt: Date.now(),
+          referer: request.headers().referer || "",
+        });
+      } catch (e) {}
+    });
+
+    // Authenticate with proxy if enabled
+    if (PROXY_ENABLED && PROXY_USER && PROXY_PASS) {
+      await page.authenticate({
+        username: PROXY_USER,
+        password: PROXY_PASS,
+      });
+    }
+
+    await page.setUserAgent(DEFAULT_UA);
+    await page.setViewport({ width: 1920, height: 1080 });
+
+    // Apply platform override to match Safari on macOS
+    await page.evaluateOnNewDocument(() => {
+      Object.defineProperty(navigator, "platform", {
+        get: () => "MacIntel",
+        configurable: true,
+      });
+    });
+
+    await page.evaluateOnNewDocument(() => {
+      if (typeof window.process === "undefined") {
+        window.process = {
+          env: { NODE_ENV: "production" },
+          browser: true,
+          version: "",
+          versions: {},
+        };
+      }
+    });
+
+    await initPageWithLocalSdk(idn);
+    const verified = await _signDirectly(idn, SIGNATURE_SMOKE_TEST_URL, null, false);
+    if (!verified.xBogus || !verified.xGnarly) {
+      throw new Error("Signature verification returned an empty signature");
+    }
+    idn.lastSignatureVerificationTime = new Date().toISOString();
+
+    idn.createdAt = Date.now();
+    idn.ready = true;
+    console.log(`[Identity ${idn.id}] Ready`);
+    return idn;
+  } catch (e) {
+    console.error(`[Identity ${idn.id}] Init error:`, e.message);
+    await destroyIdentity(idn);
+    e.statusCode = 503;
+    throw e;
   }
-
-  lastSignatureVerificationTime = new Date().toISOString();
-  console.log("[Server] Signature generation verified successfully");
 }
 
-async function closeBrowser() {
-  isReady = false;
-  cookies = null;
-  generationCount = 0;
-  initMethod = null;
-  lastInitTime = null;
-  lastSignatureVerificationTime = null;
-  signedUrlCache.clear();
+// Only operations sharing one page wait for each other. Marking an identity
+// retired prevents queued work from starting; an active operation can finish.
+function useIdentity(idn, operation) {
+  idn.pendingOperations++;
+  const result = idn.operation
+    .then(() => {
+      if (idn.retired) {
+        const error = new Error("Identity retired");
+        error.statusCode = 503;
+        throw error;
+      }
+      return operation();
+    })
+    .finally(() => {
+      idn.pendingOperations--;
+      notifyIdentityWaiters();
+    });
+  idn.operation = result.then(
+    () => {},
+    () => {},
+  );
+  return result;
+}
 
-  const browserToClose = browser;
-  browser = null;
-  page = null;
-
-  if (browserToClose) {
+async function destroyIdentity(idn) {
+  if (idn.closing) return idn.closing;
+  idn.ready = false;
+  idn.retired = true;
+  const i = identities.indexOf(idn);
+  if (i >= 0) {
+    identities.splice(i, 1);
+    notifyIdentityWaiters();
+  }
+  idn.closing = (async () => {
+    await idn.operation;
     try {
-      await browserToClose.close();
+      if (idn.context) await idn.context.close();
     } catch (e) {
-      console.error("[Server] Error closing browser:", e.message);
+      // context may already be gone
     }
-  }
-
-  // Clean up user data directory to prevent disk space accumulation
-  try {
-    if (fs.existsSync(USER_DATA_DIR)) {
-      fs.rmSync(USER_DATA_DIR, { recursive: true, force: true });
-      console.log("[Server] Cleaned up browser profile directory");
-    }
-  } catch (e) {
-    console.error("[Server] Error cleaning up profile:", e.message);
-  }
-
-  console.log("[Server] Browser closed, all state reset");
-}
-
-async function restartBrowserInternal() {
-  console.log("[Server] Restarting browser...");
-  await closeBrowser();
-  await initBrowser();
-}
-
-const restartCoordinator = new RestartCoordinator({
-  enqueue: queueBrowserOperation,
-  restart: restartBrowserInternal,
-  cooldownMs: RESTART_COOLDOWN_MS,
-  failureBackoffMs: RESTART_FAILURE_BACKOFF_MS,
-});
-
-/**
- * Check if the browser session should be refreshed based on age or generation count
- */
-function shouldRefreshSession() {
-  if (!lastInitTime) return false;
-
-  const sessionAge = Date.now() - new Date(lastInitTime).getTime();
-
-  if (generationCount >= MAX_GENERATIONS_BEFORE_REFRESH) {
-    console.log(
-      `[Server] Session refresh needed: ${generationCount} generations reached`,
-    );
-    return true;
-  }
-
-  if (sessionAge >= MAX_SESSION_AGE_MS) {
-    console.log(
-      `[Server] Session refresh needed: ${Math.round(sessionAge / 60000)} minutes elapsed`,
-    );
-    return true;
-  }
-
-  return false;
+    idn.context = null;
+    idn.page = null;
+  })();
+  return idn.closing;
 }
 
 /**
- * Check if the page is still valid and ready
+ * Retire an identity: spin up its replacement first (so capacity never drops
+ * to zero), then close it. Idempotent.
  */
-async function ensurePageReady() {
-  if (shouldRefreshSession()) {
-    console.log("[Server] Proactive session refresh...");
-    await restartBrowserInternal();
-    return true;
+async function retireIdentity(idn, reason) {
+  if (idn.retired || idn.retiring) return;
+  idn.retiring = true;
+  console.log(
+    `[Identity ${idn.id}] Retiring (${reason}; ${idn.generationCount} signatures, ${Math.round(idn.ageMs / 1000)}s old)`,
+  );
+
+  // Keep serving from this identity until a replacement is ready, unless we
+  // still have other ready identities to carry the load.
+  const othersReady = identities.filter(
+    (x) => x !== idn && x.ready && !x.retiring,
+  );
+  if (othersReady.length === 0) {
+    try {
+      await addIdentity();
+    } catch (e) {
+      console.error(
+        `[Identity ${idn.id}] Replacement failed, keeping old identity for now:`,
+        e.message,
+      );
+      idn.retiring = false;
+      return;
+    }
   }
 
-  try {
-    if (!browser || !page) {
-      throw new Error("Browser or page not initialized");
-    }
+  // Removal from selection is immediate; draining active work must not hold
+  // up requests that can use another ready identity.
+  destroyIdentity(idn).catch((e) =>
+    console.error(
+      `[Identity ${idn.id}] Close after retirement failed:`,
+      e.message,
+    ),
+  );
+  replaceIdentityInBackground();
+}
 
-    await page.mainFrame();
-    return true;
-  } catch (e) {
-    console.log("[Server] Page invalid, reinitializing...", e.message);
-    await restartBrowserInternal();
-    return true;
+async function addIdentity() {
+  replacementsInFlight++;
+  const creation = createIdentity();
+  pendingIdentityCreations.add(creation);
+  try {
+    const idn = await creation;
+    identities.push(idn);
+    notifyIdentityWaiters();
+    return idn;
+  } finally {
+    pendingIdentityCreations.delete(creation);
+    replacementsInFlight--;
   }
 }
+
+function replaceIdentityInBackground() {
+  if (poolRestarting) return;
+  if (identities.length + replacementsInFlight >= IDENTITY_POOL_SIZE) return;
+  addIdentity().catch((e) =>
+    console.error(
+      "[Server] Background identity replacement failed:",
+      e.message,
+    ),
+  );
+}
+
+/**
+ * Warm the pool up to IDENTITY_POOL_SIZE. The first identity is awaited so the
+ * server can answer as soon as one exists; the rest come up in the background.
+ */
+async function warmPool() {
+  if (poolWarming) return poolWarming;
+  poolWarming = (async () => {
+    const readyCount = () => identities.filter((x) => x.ready).length;
+    if (readyCount() === 0) {
+      await addIdentity();
+    }
+    const missing =
+      IDENTITY_POOL_SIZE - identities.length - replacementsInFlight;
+    for (let i = 0; i < missing; i++) {
+      addIdentity().catch((e) =>
+        console.error("[Server] Pool warm-up identity failed:", e.message),
+      );
+    }
+  })();
+  try {
+    await poolWarming;
+  } finally {
+    poolWarming = null;
+  }
+}
+
+// Restart requests share only the pool transition, not the signing/fetch queue.
+async function restartPool() {
+  if (poolRestarting) return poolRestarting;
+  poolRestarting = (async () => {
+    if (poolWarming) await poolWarming.catch(() => {});
+    await Promise.allSettled([...pendingIdentityCreations]);
+    await Promise.all([...identities].map(destroyIdentity));
+    await warmPool();
+  })();
+  try {
+    await poolRestarting;
+  } finally {
+    poolRestarting = null;
+  }
+}
+
+/**
+ * Select an idle identity and register its operation before yielding, so
+ * concurrent waiters cannot reserve the same idle slot. Return the identity
+ * and result promise so callers can handle operation failures with its owner.
+ */
+async function scheduleIdentityOperation(operation) {
+  while (true) {
+    if (poolRestarting) await poolRestarting;
+    // Retire exhausted identities (replacement is handled inside retireIdentity)
+    for (const idn of [...identities]) {
+      if (idn.shouldRetire() && !idn.retiring) {
+        await retireIdentity(
+          idn,
+          idn.generationCount >= MAX_GENERATIONS_BEFORE_REFRESH
+            ? "signature budget"
+            : "age",
+        );
+      }
+    }
+
+    if (poolRestarting) await poolRestarting;
+    let ready = identities.filter((x) => x.ready && !x.retired);
+    if (ready.length === 0) {
+      await warmPool();
+      ready = identities.filter((x) => x.ready && !x.retired);
+    }
+    if (ready.length === 0) {
+      throw new Error("No ready identity in pool");
+    }
+
+    // Top the pool back up if something failed earlier
+    if (identities.length + replacementsInFlight < IDENTITY_POOL_SIZE) {
+      replaceIdentityInBackground();
+    }
+
+    const idle = ready.filter((idn) => idn.pendingOperations === 0);
+    if (idle.length > 0) {
+      rrCursor = (rrCursor + 1) % idle.length;
+      const identity = idle[rrCursor];
+      return {
+        identity,
+        result: useIdentity(identity, () => operation(identity)),
+      };
+    }
+    // Registration is synchronous with the busy check so no wake-up is lost.
+    // New identities and retirement also wake us; no request is pinned here.
+    await new Promise((resolve) => identityWaiters.add(resolve));
+  }
+}
+
+/**
+ * /report: a caller saw TikTok answer an empty body for a request carrying
+ * this identity's cookies. Retire it now instead of waiting for the budget.
+ */
+function findIdentityByCookieValue(value) {
+  if (!value) return null;
+  const candidates = [value];
+  try {
+    candidates.push(decodeURIComponent(value));
+  } catch (e) {}
+  try {
+    candidates.push(encodeURIComponent(value));
+  } catch (e) {}
+  for (const idn of identities) {
+    for (const v of candidates) {
+      if (idn.cookieIndex.has(v)) return idn;
+    }
+  }
+  return null;
+}
+
+function requireFetchIdentity(msToken, expectedOwner = null) {
+  const owner = findIdentityByCookieValue(msToken);
+  if (
+    owner &&
+    owner.ready &&
+    !owner.retired &&
+    (!expectedOwner || owner === expectedOwner)
+  ) {
+    return owner;
+  }
+  const error = new Error(
+    "URL identity is unavailable or its msToken changed; request a new signature before fetching",
+  );
+  error.statusCode = 409;
+  throw error;
+}
+
+function extractCookieValue(cookieHeader, name) {
+  if (!cookieHeader) return null;
+  const re = new RegExp(`(?:^|;\\s*)${name}=([^;]+)`, "g");
+  let last = null;
+  let m;
+  while ((m = re.exec(cookieHeader)) !== null) last = m[1];
+  return last;
+}
+
+// ---------------------------------------------------------------------------
+// Signing
+// ---------------------------------------------------------------------------
 
 /**
  * Generate signed URL for any TikTok URL
@@ -604,26 +913,19 @@ async function generateSignedUrl(
   userAgent = null,
   navigateTo = null,
 ) {
-  return queueBrowserOperation("signature", () =>
+  return queueSignatureRequest(() =>
     _generateSignedUrlInternal(targetUrl, userAgent, navigateTo),
   );
 }
 
 /**
  * Internal implementation - must be called through queue
- * @param {string} targetUrl - The URL to sign
- * @param {string|null} userAgent - Optional UA to return in response
- * @param {string|null} navigateTo - Optional TikTok page URL; when given,
- *   the response uses a page-intercept path instead of the default fast path.
  */
 async function _generateSignedUrlInternal(
   targetUrl,
   userAgent = null,
   navigateTo = null,
 ) {
-  await initBrowser();
-  await ensurePageReady();
-
   // Parse target URL - remove existing signatures and normalize fingerprint params
   const urlObj = new URL(targetUrl);
   urlObj.searchParams.delete("X-Bogus");
@@ -632,62 +934,47 @@ async function _generateSignedUrlInternal(
   normalizeUrlFingerprint(urlObj);
   const fetchUrl = urlObj.toString();
 
-  const attempt = async () => {
+  const attempt = async (idn) => {
     if (navigateTo) {
       console.log(`[Server] Sign via page intercept: navigateTo=${navigateTo}`);
-      return _signViaPageIntercept(fetchUrl, navigateTo, userAgent);
+      return _signViaPageIntercept(idn, fetchUrl, navigateTo, userAgent);
     }
-    console.log(`[Server] Signing URL: ${fetchUrl.substring(0, 100)}...`);
-    return _signDirectly(fetchUrl, userAgent);
+    console.log(
+      `[Server] Signing URL (identity ${idn.id}): ${fetchUrl.substring(0, 100)}...`,
+    );
+    return _signDirectly(idn, fetchUrl, userAgent);
   };
 
+  const { identity: idn, result } = await scheduleIdentityOperation(attempt);
   try {
-    return await attempt();
+    return await result;
   } catch (e) {
     const msg = String(e && e.message ? e.message : e);
     // SDK got detached from the page (navigation, crash, lost context).
-    // Tear the session down and rebuild it, then retry the sign once.
-    if (/SDK not initialized|SDK not ready/i.test(msg)) {
+    // Retire this identity and retry once on a fresh one.
+    if (
+      /SDK not initialized|SDK not ready|detached|Target closed|Session closed|Identity retired/i.test(
+        msg,
+      )
+    ) {
       console.log(
-        `[Server] "${msg}" — restarting browser session and retrying...`,
+        `[Server] "${msg}" — retiring identity ${idn.id} and retrying on another...`,
       );
-      await restartBrowserInternal();
-      return attempt();
+      await destroyIdentity(idn);
+      const retry = await scheduleIdentityOperation(attempt);
+      return retry.result;
     }
     throw e;
   }
 }
 
-async function fetchThroughBrowser(targetUrl) {
-  return queueBrowserOperation("fetch", async () => {
-    await initBrowser();
-    await ensurePageReady();
-
-    console.log(
-      "[Server] Fetching through browser:",
-      targetUrl.substring(0, 80) + "...",
-    );
-
-    return page.evaluate(async (url) => {
-      try {
-        const response = await fetch(url, {
-          credentials: "include",
-          headers: { Accept: "application/json" },
-        });
-        const text = await response.text();
-        return {
-          status: response.status,
-          bodyLength: text.length,
-          data: text ? JSON.parse(text) : null,
-        };
-      } catch (e) {
-        return { error: e.message };
-      }
-    }, targetUrl);
-  });
-}
-
-async function _signViaPageIntercept(targetUrl, navigateTo, userAgent = null) {
+async function _signViaPageIntercept(
+  idn,
+  targetUrl,
+  navigateTo,
+  userAgent = null,
+) {
+  const page = idn.page;
   const targetPath = new URL(targetUrl).pathname;
   const callStart = Date.now();
 
@@ -698,18 +985,18 @@ async function _signViaPageIntercept(targetUrl, navigateTo, userAgent = null) {
     waitUntil: "domcontentloaded",
     timeout: 60000,
   });
-  await dismissTikTokErrorIfPresent();
+  await dismissTikTokErrorIfPresent(page);
 
   // Wait for the permanent listener to capture a matching signed URL emitted
   // after this call started (rules out a stale entry left from a prior nav).
   // Residential proxies can be slow — give it 15s.
   const WAIT_MS = 15000;
   while (Date.now() - callStart < WAIT_MS) {
-    const c = signedUrlCache.get(targetPath);
+    const c = idn.signedUrlCache.get(targetPath);
     if (c && c.capturedAt >= callStart) {
-      cookies = await page.cookies();
-      generationCount++;
-      return parseResult(c.url, userAgent);
+      await idn.updateCookies();
+      idn.generationCount++;
+      return parseResult(idn, c.url, userAgent);
     }
     await new Promise((r) => setTimeout(r, 50));
   }
@@ -720,10 +1007,12 @@ async function _signViaPageIntercept(targetUrl, navigateTo, userAgent = null) {
 }
 
 async function _signDirectly(
+  idn,
   fetchUrl,
   userAgent = null,
   countGeneration = true,
 ) {
+  const page = idn.page;
   const out = await page.evaluate((url) => {
     if (typeof window.__sdkN === "undefined") {
       return { error: "SDK not initialized" };
@@ -814,9 +1103,9 @@ async function _signDirectly(
   u.searchParams.set("X-Bogus", out.xBogus);
   u.searchParams.set("X-Gnarly", xg);
 
-  cookies = await page.cookies();
-  if (countGeneration) generationCount++;
-  return parseResult(u.toString(), userAgent);
+  await idn.updateCookies();
+  if (countGeneration) idn.generationCount++;
+  return parseResult(idn, u.toString(), userAgent);
 }
 
 /**
@@ -856,116 +1145,10 @@ function normalizeUrlFingerprint(urlObj) {
   }
 }
 
-/**
- * Sign URL using fetch interception
- * SDK intercepts fetch and adds signature params (X-Bogus, X-Gnarly)
- * @param {string} fetchUrl - The URL to sign
- * @param {string|null} userAgent - Optional custom user agent to return in response
- */
-async function _signWithFetchInterception(fetchUrl, userAgent = null) {
-  return new Promise(async (resolve, reject) => {
-    let signedUrl = null;
-    let timeout = null;
-    let resolved = false;
-    let cleanedUp = false;
-
-    async function cleanup() {
-      if (cleanedUp) return;
-      cleanedUp = true;
-      try {
-        page.off("request", requestHandler);
-        await page.setRequestInterception(false);
-      } catch (e) {
-        // Ignore cleanup errors
-      }
-    }
-
-    const requestHandler = async (request) => {
-      if (resolved) {
-        try {
-          if (!request.isInterceptResolutionHandled()) {
-            await request.abort("aborted");
-          }
-        } catch (e) {}
-        return;
-      }
-
-      const url = request.url();
-
-      // Capture any signed request (contains X-Bogus)
-      if (url.includes("X-Bogus") && !signedUrl) {
-        signedUrl = url;
-
-        if (!resolved) {
-          resolved = true;
-          clearTimeout(timeout);
-          await cleanup();
-          generationCount++;
-          resolve(parseResult(signedUrl, userAgent));
-        }
-      }
-
-      // Abort request
-      try {
-        if (!request.isInterceptResolutionHandled()) {
-          await request.abort("aborted");
-        }
-      } catch (e) {}
-    };
-
-    try {
-      await page.setRequestInterception(true);
-    } catch (e) {
-      reject(new Error("Failed to enable request interception: " + e.message));
-      return;
-    }
-
-    page.on("request", requestHandler);
-
-    // Timeout fallback
-    timeout = setTimeout(async () => {
-      if (!resolved) {
-        resolved = true;
-        await cleanup();
-        if (signedUrl) {
-          generationCount++;
-          resolve(parseResult(signedUrl, userAgent));
-        } else {
-          reject(new Error("Timeout waiting for signed URL"));
-        }
-      }
-    }, 5000);
-
-    // Trigger fetch - SDK will sign it
-    try {
-      page
-        .evaluate((url) => {
-          fetch(url, {
-            method: "GET",
-            credentials: "include",
-            headers: { Accept: "*/*" },
-          }).catch(() => {});
-        }, fetchUrl)
-        .catch((e) => {
-          if (!resolved) {
-            console.error("[Server] page.evaluate failed:", e.message);
-          }
-        });
-    } catch (e) {
-      if (!resolved) {
-        resolved = true;
-        clearTimeout(timeout);
-        await cleanup();
-        reject(new Error("page.evaluate failed: " + e.message));
-      }
-    }
-  });
-}
-
-function parseResult(url, userAgent = null) {
+function parseResult(idn, url, userAgent = null) {
   const urlObj = new URL(url);
-  const cookieString = cookies
-    ? cookies.map((c) => `${c.name}=${c.value}`).join("; ")
+  const cookieString = idn.cookies
+    ? idn.cookies.map((c) => `${c.name}=${c.value}`).join("; ")
     : "";
   return {
     signedUrl: url,
@@ -976,6 +1159,32 @@ function parseResult(url, userAgent = null) {
     deviceId: urlObj.searchParams.get("device_id"),
     userAgent: userAgent || currentUserAgent,
     cookies: cookieString,
+    identity: idn.id,
+  };
+}
+
+// ---------------------------------------------------------------------------
+// HTTP
+// ---------------------------------------------------------------------------
+
+async function readBody(req) {
+  let body = "";
+  for await (const chunk of req) {
+    body += chunk;
+  }
+  return body;
+}
+
+function poolStats() {
+  const ready = identities.filter((x) => x.ready && !x.retired);
+  const oldest = ready.reduce((a, x) => Math.max(a, x.ageMs), 0);
+  return {
+    poolSize: IDENTITY_POOL_SIZE,
+    identities: identities.map((x) => x.summary()),
+    readyIdentities: ready.length,
+    replacementsInFlight,
+    generationCount: identities.reduce((a, x) => a + x.generationCount, 0),
+    sessionAgeMinutes: Math.round(oldest / 60000),
   };
 }
 
@@ -999,27 +1208,21 @@ async function handleRequest(req, res) {
   try {
     // Health check
     if (url.pathname === "/health") {
-      const sessionAge = lastInitTime
-        ? Date.now() - new Date(lastInitTime).getTime()
-        : 0;
+      const stats = poolStats();
       res.writeHead(200);
       res.end(
         JSON.stringify({
           status: "ok",
-          ready: isReady,
-          initializing: isInitializing,
-          initMethod: initMethod,
-          lastInitTime: lastInitTime,
-          lastSignatureVerificationTime: lastSignatureVerificationTime,
-          sessionAgeMinutes: Math.round(sessionAge / 60000),
-          generationCount: generationCount,
+          ready: stats.readyIdentities > 0,
+          initializing: !!poolWarming || replacementsInFlight > 0,
+          initMethod: identities.find((x) => x.ready)?.initMethod || null,
+          ...stats,
+          lastSignatureVerificationTime:
+            identities.find((x) => x.ready)?.lastSignatureVerificationTime || null,
           maxGenerationsBeforeRefresh: MAX_GENERATIONS_BEFORE_REFRESH,
           maxSessionAgeMinutes: MAX_SESSION_AGE_MS / 60000,
-          queueLength: browserOperationQueue.length,
-          isProcessing: browserOperationQueue.processing,
-          restarting: restartCoordinator.isRestarting,
-          restartCooldownRemainingSeconds:
-            restartCoordinator.cooldownRemainingSeconds,
+          queueLength: requestQueue.length,
+          isProcessing: isProcessingQueue,
           localSdkAvailable: !!localSdkContent,
           proxyEnabled: PROXY_ENABLED,
           userAgent: currentUserAgent,
@@ -1028,13 +1231,81 @@ async function handleRequest(req, res) {
       return;
     }
 
+    // Report a burnt identity: the caller saw an empty 200 body for a request
+    // carrying these cookies. Retire that identity now.
+    if (url.pathname === "/report" && req.method === "POST") {
+      const body = await readBody(req);
+      let json = {};
+      try {
+        json = JSON.parse(body);
+      } catch (e) {}
+      if (poolRestarting) await poolRestarting;
+      const ttwid = json.ttwid || extractCookieValue(json.cookies, "ttwid");
+      const msToken =
+        json.msToken || extractCookieValue(json.cookies, "msToken");
+      const idn =
+        findIdentityByCookieValue(ttwid) || findIdentityByCookieValue(msToken);
+
+      if (!idn) {
+        res.writeHead(200);
+        res.end(JSON.stringify({ status: "ok", action: "unknown_identity" }));
+        return;
+      }
+      if (idn.ageMs < REPORT_MIN_AGE_MS) {
+        res.writeHead(200);
+        res.end(
+          JSON.stringify({
+            status: "ok",
+            action: "ignored_too_young",
+            identity: idn.id,
+          }),
+        );
+        return;
+      }
+      if (idn.retiring || idn.retired) {
+        res.writeHead(200);
+        res.end(
+          JSON.stringify({
+            status: "ok",
+            action: "already_retiring",
+            identity: idn.id,
+          }),
+        );
+        return;
+      }
+      if (Date.now() - lastReportRetireAt < REPORT_RETIRE_COOLDOWN_MS) {
+        res.writeHead(200);
+        res.end(
+          JSON.stringify({
+            status: "ok",
+            action: "ignored_cooldown",
+            identity: idn.id,
+          }),
+        );
+        return;
+      }
+      lastReportRetireAt = Date.now();
+      console.log(
+        `[Identity ${idn.id}] Reported burnt by caller (${json.reason || "empty response"})`,
+      );
+      // Don't block the caller on the replacement warm-up.
+      retireIdentity(idn, "reported burnt").catch((e) =>
+        console.error(
+          `[Identity ${idn.id}] Retire after report failed:`,
+          e.message,
+        ),
+      );
+      res.writeHead(200);
+      res.end(
+        JSON.stringify({ status: "ok", action: "retired", identity: idn.id }),
+      );
+      return;
+    }
+
     // Fetch endpoint - makes request through browser (slower, but 100% reliable fallback)
     // Use /signature + external requests for better scalability
     if (url.pathname === "/fetch" && req.method === "POST") {
-      let body = "";
-      for await (const chunk of req) {
-        body += chunk;
-      }
+      const body = await readBody(req);
 
       let targetUrl = null;
       try {
@@ -1055,7 +1326,73 @@ async function handleRequest(req, res) {
         return;
       }
 
-      const fetchResult = await fetchThroughBrowser(targetUrl);
+      if (poolRestarting) await poolRestarting;
+      // A signed URL carries the msToken of the identity that signed it; fetch
+      // from that same identity so cookies and signature agree. Unsigned URLs
+      // (page HTML etc.) can go through any identity.
+      let parsedUrl;
+      try {
+        parsedUrl = new URL(targetUrl);
+      } catch (e) {
+        e.statusCode = 400;
+        throw e;
+      }
+      const msToken = parsedUrl.searchParams.get("msToken");
+      const requiresOwner = ["msToken", "X-Bogus", "X-Gnarly"].some((name) =>
+        parsedUrl.searchParams.has(name),
+      );
+      const fetchThroughIdentity = async (idn) => {
+        console.log(
+          `[Server] Fetching through browser (identity ${idn.id}):`,
+          targetUrl.substring(0, 80) + "...",
+        );
+        if (requiresOwner) {
+          // A preceding operation may have rotated cookies while we waited.
+          await idn.updateCookies();
+          requireFetchIdentity(msToken, idn);
+        }
+        return idn.page.evaluate(async (url) => {
+          try {
+            const response = await fetch(url, {
+              credentials: "include",
+              headers: { Accept: "application/json, text/html;q=0.9, */*;q=0.8" },
+            });
+            const text = await response.text();
+            const contentType = response.headers.get("content-type") || "";
+            // API endpoints answer JSON; page URLs (e.g. /@user/video/123) answer
+            // HTML. Parse JSON when possible, otherwise hand back the raw text so
+            // callers can extract embedded page data themselves.
+            let data = null;
+            let raw = null;
+            if (text) {
+              try {
+                data = JSON.parse(text);
+              } catch (e) {
+                raw = text;
+              }
+            }
+            return {
+              status: response.status,
+              bodyLength: text.length,
+              contentType,
+              data,
+              text: raw,
+            };
+          } catch (e) {
+            return { error: e.message };
+          }
+        }, targetUrl);
+      };
+
+      let pendingFetch;
+      if (requiresOwner) {
+        const idn = requireFetchIdentity(msToken);
+        pendingFetch = useIdentity(idn, () => fetchThroughIdentity(idn));
+      } else {
+        const scheduled = await scheduleIdentityOperation(fetchThroughIdentity);
+        pendingFetch = scheduled.result;
+      }
+      const fetchResult = await pendingFetch;
 
       console.log(
         "[Server] Fetch result:",
@@ -1075,17 +1412,16 @@ async function handleRequest(req, res) {
         JSON.stringify({
           status: "ok",
           httpStatus: fetchResult.status,
+          contentType: fetchResult.contentType,
           data: fetchResult.data,
+          ...(fetchResult.text != null && { text: fetchResult.text }),
         }),
       );
       return;
     }
 
     if (url.pathname === "/signature" && req.method === "POST") {
-      let body = "";
-      for await (const chunk of req) {
-        body += chunk;
-      }
+      const body = await readBody(req);
 
       let targetUrl = null;
       let userAgent = null;
@@ -1129,6 +1465,7 @@ async function handleRequest(req, res) {
             "x-gnarly": result.xGnarly,
             "device-id": result.deviceId,
             cookies: result.cookies,
+            identity: result.identity,
             navigator: {
               user_agent: result.userAgent,
               platform: "MacIntel",
@@ -1143,21 +1480,15 @@ async function handleRequest(req, res) {
       return;
     }
 
-    // Restart browser
-    if (
-      url.pathname === "/restart" &&
-      (req.method === "GET" || req.method === "POST")
-    ) {
-      const restartRequest = restartCoordinator.request();
-      await restartRequest.promise;
+    if (url.pathname === "/restart") {
+      console.log("[Server] Restarting pool...");
+      await restartPool();
       res.writeHead(200);
       res.end(
         JSON.stringify({
           status: "ok",
-          message: "Browser restarted and signature generation verified",
-          ready: isReady,
-          signatureVerifiedAt: lastSignatureVerificationTime,
-          coalesced: restartRequest.coalesced,
+          message: "Pool restarted",
+          ...poolStats(),
         }),
       );
       return;
@@ -1168,20 +1499,7 @@ async function handleRequest(req, res) {
     res.end(JSON.stringify({ error: "Not found" }));
   } catch (e) {
     console.error("[Server] Error:", e.message);
-    const statusCode = e.statusCode || 500;
-    if (e instanceof RestartRateLimitError) {
-      res.setHeader("Retry-After", String(e.retryAfterSeconds));
-      res.writeHead(statusCode);
-      res.end(
-        JSON.stringify({
-          status: "rate_limited",
-          message: e.message,
-          retryAfterSeconds: e.retryAfterSeconds,
-        }),
-      );
-      return;
-    }
-    res.writeHead(statusCode);
+    res.writeHead(e.statusCode || 500);
     res.end(JSON.stringify({ status: "error", message: e.message }));
   }
 }
@@ -1191,6 +1509,7 @@ const server = http.createServer(handleRequest);
 
 server.listen(PORT, () => {
   console.log(`[Server] TikTok Signature Server running on port ${PORT}`);
+  console.log(`[Server] Identity pool size: ${IDENTITY_POOL_SIZE}`);
   console.log(`[Server] Endpoints:`);
   console.log(
     `  POST /signature - Generate signed URL (RECOMMENDED for scalability)`,
@@ -1198,13 +1517,14 @@ server.listen(PORT, () => {
   console.log(
     `  POST /fetch     - Fetch through browser (fallback, 100% reliable)`,
   );
+  console.log(`  POST /report    - Report a burnt identity (retired at once)`);
   console.log(`  GET  /health    - Health check`);
-  console.log(`  GET/POST /restart - Restart browser session`);
-
-  // Initialize browser on startup
-  queueBrowserOperation("startup", initBrowser).catch((e) =>
-    console.error("[Server] Init failed:", e.message),
+  console.log(
+    `  GET  /restart   - Retire all identities and warm a fresh pool`,
   );
+
+  // Warm the pool on startup
+  warmPool().catch((e) => console.error("[Server] Init failed:", e.message));
 });
 
 // Graceful shutdown
