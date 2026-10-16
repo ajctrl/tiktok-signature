@@ -629,7 +629,12 @@ async function createIdentity() {
     });
 
     await initPageWithLocalSdk(idn);
-    const verified = await _signDirectly(idn, SIGNATURE_SMOKE_TEST_URL, null, false);
+    const verified = await _signDirectly(
+      idn,
+      SIGNATURE_SMOKE_TEST_URL,
+      null,
+      false,
+    );
     if (!verified.xBogus || !verified.xGnarly) {
       throw new Error("Signature verification returned an empty signature");
     }
@@ -1218,7 +1223,8 @@ async function handleRequest(req, res) {
           initMethod: identities.find((x) => x.ready)?.initMethod || null,
           ...stats,
           lastSignatureVerificationTime:
-            identities.find((x) => x.ready)?.lastSignatureVerificationTime || null,
+            identities.find((x) => x.ready)?.lastSignatureVerificationTime ||
+            null,
           maxGenerationsBeforeRefresh: MAX_GENERATIONS_BEFORE_REFRESH,
           maxSessionAgeMinutes: MAX_SESSION_AGE_MS / 60000,
           queueLength: requestQueue.length,
@@ -1355,7 +1361,9 @@ async function handleRequest(req, res) {
           try {
             const response = await fetch(url, {
               credentials: "include",
-              headers: { Accept: "application/json, text/html;q=0.9, */*;q=0.8" },
+              headers: {
+                Accept: "application/json, text/html;q=0.9, */*;q=0.8",
+              },
             });
             const text = await response.text();
             const contentType = response.headers.get("content-type") || "";

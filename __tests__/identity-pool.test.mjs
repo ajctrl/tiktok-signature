@@ -87,9 +87,16 @@ async function harness({ poolSize = 2, failedSignatures = 0, env = {} } = {}) {
               return { error: "SDK not ready" };
             }
           }
-          assert.equal(context.closed, false, "operation used a retired context");
+          assert.equal(
+            context.closed,
+            false,
+            "operation used a retired context",
+          );
           browserGlobals.argument = arg;
-          return vm.runInContext(`(${fn.toString()})(argument)`, browserGlobals);
+          return vm.runInContext(
+            `(${fn.toString()})(argument)`,
+            browserGlobals,
+          );
         },
       };
       context.newPage = async () => page;
@@ -386,7 +393,9 @@ for (const reason of ["signature budget", "age"]) {
     h.controls.beforeNavigate = async (identity) => {
       if (identity === 2) await secondIdentity.promise;
     };
-    await h.request("/signature", { url: "https://www.tiktok.com/api/example/" });
+    await h.request("/signature", {
+      url: "https://www.tiktok.com/api/example/",
+    });
     if (reason === "age") h.controls.now += 2000;
     secondIdentity.resolve();
     await waitForPool(h);
