@@ -32,6 +32,7 @@
  */
 
 import http from "http";
+import { Buffer } from "node:buffer";
 import fs from "fs";
 import path from "path";
 import { fileURLToPath } from "url";
@@ -1206,11 +1207,12 @@ function parseResult(idn, url, userAgent = null) {
 // ---------------------------------------------------------------------------
 
 async function readBody(req) {
-  let body = "";
+  const chunks = [];
   for await (const chunk of req) {
-    body += chunk;
+    chunks.push(chunk);
   }
-  return body;
+  // Decode once so UTF-8 characters split across chunks remain intact.
+  return Buffer.concat(chunks).toString("utf8");
 }
 
 function poolStats() {

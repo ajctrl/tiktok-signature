@@ -180,7 +180,12 @@ async function harness({ poolSize = 2, failedSignatures = 0, env = {} } = {}) {
     );
   });
   await module.evaluate();
-  async function request(url, body, method = body ? "POST" : "GET") {
+  async function request(
+    url,
+    body,
+    method = body ? "POST" : "GET",
+    chunks = null,
+  ) {
     let status;
     let result;
     const headers = {};
@@ -189,7 +194,8 @@ async function harness({ poolSize = 2, failedSignatures = 0, env = {} } = {}) {
         url,
         method,
         async *[Symbol.asyncIterator]() {
-          if (body) yield JSON.stringify(body);
+          if (chunks !== null) yield* chunks;
+          else if (body) yield Buffer.from(JSON.stringify(body), "utf8");
         },
       },
       {
@@ -712,6 +718,54 @@ test("POST signing passes exact body bytes to both signers without charging smok
   );
   assert.equal(h.controls.bogusCalls[1].query, h.controls.gnarlyCalls[1].query);
   assert.equal((await h.request("/health")).body.generationCount, 1);
+});
+
+test("POST bodies preserve UTF-8 characters across every chunk boundary", async () => {
+  const h = await harness({ poolSize: 1 });
+  const body = ' { "text": "日本語 🍵 café", "value": 1 }\n';
+  const bytes = Buffer.from(
+    JSON.stringify({
+      url: "https://www.tiktok.com/api/example/",
+      body,
+    }),
+    "utf8",
+  );
+  const deliveries = [];
+  for (let split = 1; split < bytes.length; split++) {
+    deliveries.push([bytes.subarray(0, split), bytes.subarray(split)]);
+  }
+  deliveries.push(Array.from(bytes, (byte) => Buffer.from([byte])));
+  for (const chunks of deliveries) {
+    const result = await h.request("/signature", null, "POST", chunks);
+    assert.equal(result.status, 200);
+    assert.equal(h.controls.bogusCalls.at(-1).body, body);
+    assert.equal(h.controls.gnarlyCalls.at(-1).body, body);
+  }
+});
+
+test("chunked plain-text URLs still sign and empty or invalid bodies return 400", async () => {
+  const h = await harness({ poolSize: 1 });
+  const bytes = Buffer.from(
+    "https://www.tiktok.com/api/example/?q=日本語🍵",
+    "utf8",
+  );
+  const result = await h.request(
+    "/signature",
+    null,
+    "POST",
+    Array.from(bytes, (byte) => Buffer.from([byte])),
+  );
+  assert.equal(result.status, 200);
+  assert.equal(
+    new URL(result.body.data.signed_url).searchParams.get("q"),
+    "日本語🍵",
+  );
+  assert.equal(h.controls.bogusCalls.at(-1).body, "");
+  for (const chunks of [[], [Buffer.from('{"url":'), Buffer.from("broken}")]]) {
+    const invalid = await h.request("/signature", null, "POST", chunks);
+    assert.equal(invalid.status, 400);
+    assert.match(invalid.body.message, /URL is required/);
+  }
 });
 
 test("POST signing serializes JSON values and preserves empty-body GET behavior", async () => {
